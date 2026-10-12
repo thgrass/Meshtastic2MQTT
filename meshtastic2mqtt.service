@@ -1,0 +1,31 @@
+# EDIT TO FIT YOUR SETUP !
+# /etc/systemd/system/meshtastic2mqtt.service
+#
+# Install:
+#   sudo cp meshtastic2mqtt.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now meshtastic2mqtt
+#   journalctl -u meshtastic2mqtt -f
+#
+# IMPORTANT: adjust User= and the paths in ExecStart= to your setup.
+# The user must be the SAME one you used for BLE pairing (bluetoothctl),
+# because BlueZ pairing keys are stored per-user. If the service runs
+# as a different user, the BLE connection will be rejected.
+
+[Unit]
+Description=Meshtastic BLE to MQTT Bridge
+After=bluetooth.target mosquitto.service
+Requires=bluetooth.target
+
+[Service]
+Type=simple
+User=pi
+ExecStart=/home/pi/bridge-venv/bin/python3 /home/pi/Meshtastic2MQTT.py
+Restart=always
+RestartSec=10
+
+# Give BlueZ time to come up after boot before we start hammering it
+ExecStartPre=/bin/sleep 5
+
+[Install]
+WantedBy=multi-user.target
