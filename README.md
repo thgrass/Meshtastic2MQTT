@@ -132,7 +132,7 @@ mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/topology' -C 1 > topology.
 - `nodes.json` — every node with `lat`/`lon`/`alt` (if it broadcasts GPS), name, battery, `snr`, `lastHeard`
 - `topology.json` — edge list `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`
 
-Join both on `id` and you have a geographic graph: nodes at their real positions, edges between them, SNR as color or line thickness. Drops straight into Leaflet, D3, Graphviz or Python's `networkx`.
+Join both on `id` and you have a geographic graph: nodes at their real positions, edges between them, SNR as color or line thickness. 
 
 Two caveats:
 
