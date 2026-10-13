@@ -28,7 +28,12 @@ Send text to the mesh (LAN -> mesh):
 Get fields: batteryLevel, voltage, channelUtilization, airUtilTx,
 uptimeSeconds, firmwareVersion, longName, shortName,
 nodes (full node list incl. positions as JSON on .../resp/nodes),
-topology (edge list from NeighborInfo packets on .../resp/topology)
+topology (edge list from NeighborInfo packets on .../resp/topology),
+get/node/<id>/<field> -> query one remote node from the node DB
+  (fields: longName, shortName, hwModel, batteryLevel, voltage,
+   channelUtilization, airUtilTx, uptimeSeconds, snr, lastHeard,
+   lat, lon, alt, or "all" for the full DB entry as JSON;
+   answer retained on .../resp/node/<id>/<field>)
 
 Requirements on the Pi:
   sudo apt install python3-venv bluetooth bluez mosquitto
@@ -58,8 +63,7 @@ from meshtastic.ble_interface import BLEInterface
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan`
-                                  # (use the MAC, not the name — the lib matches on address)
+BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan`; may work with BLE name
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 MQTT_USER = None                 # or "user" if mosquitto requires auth
@@ -191,7 +195,7 @@ def on_packet(packet, interface):
 
         # NeighborInfo packets -> mesh topology edges (for get/topology).
         # Requires the neighborinfo module enabled on the broadcasting
-        # nodes: meshtastic --set neighborinfo.enabled true
+        # nodes: meshtastic --set neighbor_info.enabled true
         neighborinfo = decoded.get("neighborInfo")
         if neighborinfo:
             edges = []
@@ -307,6 +311,57 @@ def on_mqtt_message(client, userdata, msg):
                 client.publish(
                     f"{TOPIC_PREFIX}/resp/topology",
                     json.dumps(MESH_TOPOLOGY),
+                    retain=True,
+                )
+                return
+            # meshtastic/bridge/get/node/<id>/<field> -> query a single
+            # remote node from the node DB (answer retained on
+            # meshtastic/bridge/resp/node/<id>/<field>)
+            if field == "node":
+                if len(parts) < 6:
+                    return
+                nodeid = parts[4].replace("!", "").replace("0x", "").lower()
+                nfield = parts[5]
+                resp_topic = f"{TOPIC_PREFIX}/resp/node/{nodeid}/{nfield}"
+                entry = {}
+                try:
+                    nodes = userdata["interface"].nodes or {}
+                    entry = nodes.get(int(nodeid, 16)) or nodes.get(nodeid) or {}
+                except Exception:
+                    entry = {}
+                if not entry:
+                    client.publish(resp_topic, "unknown node", retain=True)
+                    return
+                if nfield == "all":
+                    client.publish(resp_topic, json.dumps(entry), retain=True)
+                    return
+                user = entry.get("user") or {}
+                metrics = entry.get("deviceMetrics") or {}
+                pos = entry.get("position") or {}
+                lat = pos.get("latitude")
+                if lat is None and pos.get("latitudeI") is not None:
+                    lat = pos["latitudeI"] / 1e7
+                lon = pos.get("longitude")
+                if lon is None and pos.get("longitudeI") is not None:
+                    lon = pos["longitudeI"] / 1e7
+                values = {
+                    "longName": user.get("longName"),
+                    "shortName": user.get("shortName"),
+                    "hwModel": user.get("hwModel"),
+                    "batteryLevel": metrics.get("batteryLevel"),
+                    "voltage": metrics.get("voltage"),
+                    "channelUtilization": metrics.get("channelUtilization"),
+                    "airUtilTx": metrics.get("airUtilTx"),
+                    "uptimeSeconds": metrics.get("uptimeSeconds"),
+                    "snr": entry.get("snr"),
+                    "lastHeard": entry.get("lastHeard"),
+                    "lat": lat,
+                    "lon": lon,
+                    "alt": pos.get("altitude"),
+                }
+                client.publish(
+                    resp_topic,
+                    str(values.get(nfield, "unknown field")),
                     retain=True,
                 )
                 return
