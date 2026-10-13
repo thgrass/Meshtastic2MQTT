@@ -83,7 +83,7 @@ Fields: `batteryLevel`, `voltage`, `channelUtilization`, `airUtilTx`, `uptimeSec
 
 `get/nodes` is special: it returns the full mesh node list as JSON on `meshtastic/bridge/resp/nodes` — one entry per node with `id`, `longName`, `shortName`, `hwModel`, `batteryLevel`, `lastHeard` (Unix time), `snr` and, if the node broadcasts GPS, `lat`/`lon`/`alt`. That's everything you need to draw a map of your mesh, without ever disconnecting the bridge to run `meshtastic --nodes`.
 
-`get/topology` returns the mesh's link graph as JSON on `meshtastic/bridge/resp/topology`, shaped like `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`. It fills up from NeighborInfo packets — enable the module on your node (and ideally your neighbors') with `meshtastic --set neighborinfo.enabled true` (stop the bridge first; only one client can use the node at a time). Until nodes have it enabled, the answer stays `{}`.
+`get/topology` returns the mesh's link graph as JSON on `meshtastic/bridge/resp/topology`, shaped like `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`. It fills up from NeighborInfo packets — enable the module on your node (and ideally your neighbors') with `meshtastic --set neighbor_info.enabled true` (stop the bridge first; only one client can use the node at a time). Until nodes have it enabled, the answer stays `{}`.
 
 ## Try it
 
