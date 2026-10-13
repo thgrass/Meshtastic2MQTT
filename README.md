@@ -1,7 +1,8 @@
 # Meshtastic2MQTT
+
 A small Python script that connects a [Meshtastic](https://meshtastic.org) node over Bluetooth LE and bridges it to a local MQTT broker — so Home Assistant, Node-RED, Grafana or anything else on your LAN can read the mesh and talk back to it.
 
-Written for a Raspberry Pi and a solar-powered SenseCAP node, but it should work with any Meshtastic device that exposes BLE (T-Beam, RAK, Heltec, etc.) and other computers with BLE.
+Written for a Raspberry Pi and a solar-powered SenseCAP node, but it should work with any Meshtastic device that exposes BLE (T-Beam, RAK, Heltec, etc.).
 
 ## What it does
 
@@ -91,6 +92,14 @@ mosquitto_sub -h localhost -t 'meshtastic/chat' -v
 
 # ask the node for its battery, get the answer on .../resp/batteryLevel
 mosquitto_pub -h localhost -t 'meshtastic/bridge/get/batteryLevel' -n
+
+# list all nodes in the mesh
+mosquitto_pub -h localhost -t 'meshtastic/bridge/get/nodes' -n
+mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | jq .
+
+# ...or find one by name
+mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | \
+  jq -r '.[] | select(.longName | test("Solartastic"; "i"))'
 
 # say hello to everyone
 mosquitto_pub -h localhost -t 'meshtastic/bridge/to/all/text' -m 'hello mesh'
