@@ -26,7 +26,8 @@ Send text to the mesh (LAN -> mesh):
   meshtastic/bridge/to/<hex-nodeid>/text         -> direct message to one node
 
 Get fields: batteryLevel, voltage, channelUtilization, airUtilTx,
-uptimeSeconds, firmwareVersion, longName, shortName
+uptimeSeconds, firmwareVersion, longName, shortName, nodes
+(nodes = full node list of the mesh as JSON on .../resp/nodes)
 
 Requirements on the Pi:
   sudo apt install python3-venv bluetooth bluez mosquitto
@@ -39,8 +40,8 @@ Find your node's BLE address:
 Then edit BLE_TARGET below (BLE MAC address) and, if needed,
 MQTT_HOST / MQTT_USER / MQTT_PASS.
 
-Run:  ~/bridge-venv/bin/python3 Meshtastic2MQTT.py
-Or install as a service: see meshtastic2mqtt.service
+Run:  ~/bridge-venv/bin/python3 MeshBridge.py
+Or install as a service: see meshtastic-bridge.service
 """
 
 import json
@@ -56,8 +57,7 @@ from meshtastic.ble_interface import BLEInterface
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan`, may work with BLE name
-
+BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan; may work with BLE name
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 MQTT_USER = None                 # "user" if mosquitto requires auth
@@ -155,7 +155,7 @@ def on_packet(packet, interface):
                     retain=True,
                 )
 
-        # Device metrics (battery/voltage) arrive in nodeinfo packets too
+        # Device metrics (battery/voltage) arrive in nodeinfo packets
         metrics = decoded.get("deviceMetrics")
         if metrics:
             for key in ("batteryLevel", "voltage", "channelUtilization", "airUtilTx"):
@@ -244,6 +244,30 @@ def on_mqtt_message(client, userdata, msg):
             if len(parts) < 4:
                 return
             field = parts[3]
+            # meshtastic/bridge/get/nodes -> full node list as JSON
+            # (answer on meshtastic/bridge/resp/nodes, retained)
+            if field == "nodes":
+                nodes = userdata["interface"].nodes or {}
+                out = []
+                for nid, n in nodes.items():
+                    user = n.get("user") or {}
+                    metrics = n.get("deviceMetrics") or {}
+                    out.append({
+                        "id": str(user.get("id") or nid).replace("!", ""),
+                        "longName": user.get("longName"),
+                        "shortName": user.get("shortName"),
+                        "hwModel": user.get("hwModel"),
+                        "batteryLevel": metrics.get("batteryLevel"),
+                        "lastHeard": n.get("lastHeard"),
+                        "snr": n.get("snr"),
+                    })
+                out.sort(key=lambda x: (x.get("longName") or "").lower())
+                client.publish(
+                    f"{TOPIC_PREFIX}/resp/nodes",
+                    json.dumps(out),
+                    retain=True,
+                )
+                return
             try:
                 my = userdata["interface"].getMyNodeInfo()
                 metrics = my.get("deviceMetrics") or {}
@@ -339,7 +363,7 @@ def run_bridge():
             publish(f"{TOPIC_PREFIX}/status", "online", retain=True)
             log.info("Connected. Bridging BLE <-> MQTT.")
 
-            # Heartbeat so you can monitor if the bridge is alive in HA
+            # Heartbeat so you can see the bridge is alive in HA
             while True:
                 time.sleep(HEARTBEAT_INTERVAL)
                 publish(
