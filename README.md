@@ -85,6 +85,8 @@ Fields: `batteryLevel`, `voltage`, `channelUtilization`, `airUtilTx`, `uptimeSec
 
 `get/topology` returns the mesh's link graph as JSON on `meshtastic/bridge/resp/topology`, shaped like `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`. It fills up from NeighborInfo packets — enable the module on your node (and ideally your neighbors') with `meshtastic --set neighbor_info.enabled true` (stop the bridge first; only one client can use the node at a time). Until nodes have it enabled, the answer stays `{}`.
 
+`get/node/<id>/<field>` queries a single remote node from the node DB — e.g. `get/node/1fa0034c/batteryLevel`. Fields: `longName`, `shortName`, `hwModel`, `batteryLevel`, `voltage`, `channelUtilization`, `airUtilTx`, `uptimeSeconds`, `snr`, `lastHeard`, `lat`, `lon`, `alt`, or `all` for the full DB entry as JSON. The answer arrives retained on `meshtastic/bridge/resp/node/<id>/<field>`. Values are as fresh as the last packet your node heard from that node — minutes for chatty neighbors, hours for quiet ones.
+
 ## Try it
 
 ```bash
@@ -109,9 +111,13 @@ mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | \
 mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | \
   jq -r '.[] | select(.lat) | "\(.id) \(.longName) \(.lat),\(.lon)"'
 
-# mesh topology — who hears whom (needs neighborinfo enabled on nodes)
+# mesh topology — who hears whom (needs the neighbor_info module enabled on nodes)
 mosquitto_pub -h localhost -t 'meshtastic/bridge/get/topology' -n
 mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/topology' -C 1 | jq .
+
+# battery of one specific remote node
+mosquitto_pub -h localhost -t 'meshtastic/bridge/get/node/1fa0034c/batteryLevel' -n
+mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/node/1fa0034c/batteryLevel' -C 1
 
 # say hello to everyone
 mosquitto_pub -h localhost -t 'meshtastic/bridge/to/all/text' -m 'hello mesh'
@@ -132,7 +138,7 @@ mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/topology' -C 1 > topology.
 - `nodes.json` — every node with `lat`/`lon`/`alt` (if it broadcasts GPS), name, battery, `snr`, `lastHeard`
 - `topology.json` — edge list `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`
 
-Join both on `id` and you have a geographic graph: nodes at their real positions, edges between them, SNR as color or line thickness. 
+Join both on `id` and you have a geographic graph: nodes at their real positions, edges between them, SNR as color or line thickness. Drops straight into Leaflet, D3, Graphviz or Python's `networkx`.
 
 Two caveats:
 
@@ -163,7 +169,7 @@ Wire `meshtastic/chat/dm` to a notification automation if you want a ping when s
 
 - Battery and friends refresh when the node broadcasts nodeinfo (every ~3 h by default). For hourly updates, enable device telemetry on the node (`telemetry.device_telemetry_enabled`) and set `device_update_interval`.
 - Meshtastic is best-effort: broadcasts aren't guaranteed to reach every node, and this bridge can't change that.
-- Only one client can talk to the node at a time — don't run this while also running `meshtastic` CLI against the same node or having your phone connected.
+- Only one client can talk to the node at a time — don't run this while also running `meshtastic` CLI against the same node or your phone connected.
 
 ## License
 
