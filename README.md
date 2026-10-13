@@ -41,15 +41,15 @@ python3 -m venv ~/bridge-venv
    [bluetooth]# exit
    ```
 
-3. Put the address in `BLE_TARGET` in `MeshBridge.py` (also check `MQTT_HOST` / credentials if your broker isn't plain localhost).
+3. Put the address in `BLE_TARGET` in `Meshtastic2MQTT.py` (also check `MQTT_HOST` / credentials if your broker isn't plain localhost).
 
 4. Run it:
 
    ```bash
-   ~/bridge-venv/bin/python3 MeshBridge.py
+   ~/bridge-venv/bin/python3 Meshtastic2MQTT.py
    ```
 
-5. Or run it as a service with the included `meshtastic-bridge.service` systemd unit (edit the paths and user first).
+5. Or run it as a service with the included `meshtastic2mqtt.service` systemd unit (edit the paths and user first).
 
 ## Topics
 
@@ -81,6 +81,10 @@ python3 -m venv ~/bridge-venv
 
 Fields: `batteryLevel`, `voltage`, `channelUtilization`, `airUtilTx`, `uptimeSeconds`, `firmwareVersion`, `longName`, `shortName`.
 
+`get/nodes` is special: it returns the full mesh node list as JSON on `meshtastic/bridge/resp/nodes` — one entry per node with `id`, `longName`, `shortName`, `hwModel`, `batteryLevel`, `lastHeard` (Unix time), `snr` and, if the node broadcasts GPS, `lat`/`lon`/`alt`. That's everything you need to draw a map of your mesh, without ever disconnecting the bridge to run `meshtastic --nodes`.
+
+`get/topology` returns the mesh's link graph as JSON on `meshtastic/bridge/resp/topology`, shaped like `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`. It fills up from NeighborInfo packets — enable the module on your node (and ideally your neighbors') with `meshtastic --set neighborinfo.enabled true` (stop the bridge first; only one client can use the node at a time). Until nodes have it enabled, the answer stays `{}`.
+
 ## Try it
 
 ```bash
@@ -101,9 +105,41 @@ mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | jq .
 mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | \
   jq -r '.[] | select(.longName | test("Solartastic"; "i"))'
 
+# positions for mapping (id, name, lat, lon)
+mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | \
+  jq -r '.[] | select(.lat) | "\(.id) \(.longName) \(.lat),\(.lon)"'
+
+# mesh topology — who hears whom (needs neighborinfo enabled on nodes)
+mosquitto_pub -h localhost -t 'meshtastic/bridge/get/topology' -n
+mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/topology' -C 1 | jq .
+
 # say hello to everyone
 mosquitto_pub -h localhost -t 'meshtastic/bridge/to/all/text' -m 'hello mesh'
 ```
+
+## Drawing a map or graph of your mesh
+
+Two requests give you everything a visualization needs:
+
+```bash
+mosquitto_pub -h localhost -t 'meshtastic/bridge/get/nodes' -n
+mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 > nodes.json
+
+mosquitto_pub -h localhost -t 'meshtastic/bridge/get/topology' -n
+mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/topology' -C 1 > topology.json
+```
+
+- `nodes.json` — every node with `lat`/`lon`/`alt` (if it broadcasts GPS), name, battery, `snr`, `lastHeard`
+- `topology.json` — edge list `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`
+
+Join both on `id` and you have a geographic graph: nodes at their real positions, edges between them, SNR as color or line thickness. Drops straight into Leaflet, D3, Graphviz or Python's `networkx`.
+
+Two caveats:
+
+- Nodes without GPS stay off the map (they're still in the node list, just without coordinates).
+- The topology only fills up if nodes broadcast NeighborInfo (see `get/topology` above). Until then the only link data you have is the `snr` values in `nodes.json` — how well *your* node hears each sender.
+
+Since both `resp` topics are retained, a cron job that re-issues the two gets and stores the answers gives you a history of your mesh's shape for free.
 
 ## Home Assistant
 
