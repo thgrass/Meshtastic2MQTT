@@ -26,8 +26,9 @@ Send text to the mesh (LAN -> mesh):
   meshtastic/bridge/to/<hex-nodeid>/text         -> direct message to one node
 
 Get fields: batteryLevel, voltage, channelUtilization, airUtilTx,
-uptimeSeconds, firmwareVersion, longName, shortName, nodes
-(nodes = full node list of the mesh as JSON on .../resp/nodes)
+uptimeSeconds, firmwareVersion, longName, shortName,
+nodes (full node list incl. positions as JSON on .../resp/nodes),
+topology (edge list from NeighborInfo packets on .../resp/topology)
 
 Requirements on the Pi:
   sudo apt install python3-venv bluetooth bluez mosquitto
@@ -40,8 +41,8 @@ Find your node's BLE address:
 Then edit BLE_TARGET below (BLE MAC address) and, if needed,
 MQTT_HOST / MQTT_USER / MQTT_PASS.
 
-Run:  ~/bridge-venv/bin/python3 MeshBridge.py
-Or install as a service: see meshtastic-bridge.service
+Run:  ~/bridge-venv/bin/python3 Meshtastic2MQTT.py
+Or install as a service: see meshtastic2mqtt.service
 """
 
 import json
@@ -57,11 +58,12 @@ from meshtastic.ble_interface import BLEInterface
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan; may work with BLE name
+BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan`
+                                  # (use the MAC, not the name — the lib matches on address)
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
-MQTT_USER = None                 # "user" if mosquitto requires auth
-MQTT_PASS = None                 # "pass"
+MQTT_USER = None                 # or "user" if mosquitto requires auth
+MQTT_PASS = None                 # or "pass"
 MQTT_TLS = False                 # True if broker requires TLS
 TOPIC_PREFIX = "meshtastic/bridge"
 NODE_TOPIC_PREFIX = "meshtastic/node"
@@ -123,6 +125,11 @@ def _get_firmware(interface):
     return None
 
 
+# NeighborInfo packets (needs the neighborinfo module enabled on the
+# nodes) feed a topology map: source node id -> list of edges
+MESH_TOPOLOGY = {}
+
+
 def on_packet(packet, interface):
     """Main callback for every mesh packet received from the node."""
     try:
@@ -155,7 +162,7 @@ def on_packet(packet, interface):
                     retain=True,
                 )
 
-        # Device metrics (battery/voltage) arrive in nodeinfo packets
+        # Device metrics (battery/voltage) arrive in nodeinfo packets too
         metrics = decoded.get("deviceMetrics")
         if metrics:
             for key in ("batteryLevel", "voltage", "channelUtilization", "airUtilTx"):
@@ -181,6 +188,19 @@ def on_packet(packet, interface):
                 payload["alt"] = pos.get("altitude", 0)
             if payload:
                 publish(f"{NODE_TOPIC_PREFIX}/{nodeid}/position", json.dumps(payload))
+
+        # NeighborInfo packets -> mesh topology edges (for get/topology).
+        # Requires the neighborinfo module enabled on the broadcasting
+        # nodes: meshtastic --set neighborinfo.enabled true
+        neighborinfo = decoded.get("neighborInfo")
+        if neighborinfo:
+            edges = []
+            for nb in neighborinfo.get("neighbors") or []:
+                peer = nb.get("nodeId")
+                if isinstance(peer, int):
+                    edges.append({"to": f"{peer:08x}", "snr": nb.get("snr")})
+            if edges:
+                MESH_TOPOLOGY[nodeid] = edges
 
         # Text messages + unified chat stream (broadcast vs DM)
         text = decoded.get("text")
@@ -252,7 +272,8 @@ def on_mqtt_message(client, userdata, msg):
                 for nid, n in nodes.items():
                     user = n.get("user") or {}
                     metrics = n.get("deviceMetrics") or {}
-                    out.append({
+                    pos = n.get("position") or {}
+                    entry = {
                         "id": str(user.get("id") or nid).replace("!", ""),
                         "longName": user.get("longName"),
                         "shortName": user.get("shortName"),
@@ -260,11 +281,32 @@ def on_mqtt_message(client, userdata, msg):
                         "batteryLevel": metrics.get("batteryLevel"),
                         "lastHeard": n.get("lastHeard"),
                         "snr": n.get("snr"),
-                    })
+                    }
+                    lat = pos.get("latitude")
+                    if lat is None and pos.get("latitudeI") is not None:
+                        lat = pos["latitudeI"] / 1e7
+                    lon = pos.get("longitude")
+                    if lon is None and pos.get("longitudeI") is not None:
+                        lon = pos["longitudeI"] / 1e7
+                    if lat is not None and lon is not None:
+                        entry["lat"] = lat
+                        entry["lon"] = lon
+                        if pos.get("altitude") is not None:
+                            entry["alt"] = pos.get("altitude")
+                    out.append(entry)
                 out.sort(key=lambda x: (x.get("longName") or "").lower())
                 client.publish(
                     f"{TOPIC_PREFIX}/resp/nodes",
                     json.dumps(out),
+                    retain=True,
+                )
+                return
+            # meshtastic/bridge/get/topology -> edge list built from
+            # NeighborInfo packets (answer on .../resp/topology)
+            if field == "topology":
+                client.publish(
+                    f"{TOPIC_PREFIX}/resp/topology",
+                    json.dumps(MESH_TOPOLOGY),
                     retain=True,
                 )
                 return
