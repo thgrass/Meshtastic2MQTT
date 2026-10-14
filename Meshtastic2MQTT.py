@@ -33,7 +33,19 @@ get/node/<id>/<field> -> query one remote node from the node DB
   (fields: longName, shortName, hwModel, batteryLevel, voltage,
    channelUtilization, airUtilTx, uptimeSeconds, snr, lastHeard,
    lat, lon, alt, or "all" for the full DB entry as JSON;
-   answer retained on .../resp/node/<id>/<field>)
+   answer retained on .../resp/node/<id>/<field>),
+channel (share URL for this node's channel on .../resp/channel —
+  this is the exact content a Meshtastic QR code encodes),
+channelchallenge (one-time nonce for set/channel, on
+  .../resp/channelchallenge, valid 10 minutes)
+
+Set topic meshtastic/bridge/set/channel:
+  Import a channel URL (from a QR code / channel link) into the
+  node. REPLACES channels and LoRa settings; the node reboots.
+  Payload: JSON {"url": "<full channel URL>", "confirm": "<nonce>"}
+  — get the nonce first via get/channelchallenge. Result (retained)
+  on .../resp/channel/result. Refuses imports that would change the
+  LoRa region (would silently split the mesh).
 
 Requirements on the Pi:
   sudo apt install python3-venv bluetooth bluez mosquitto
@@ -50,8 +62,12 @@ Run:  ~/bridge-venv/bin/python3 Meshtastic2MQTT.py
 Or install as a service: see meshtastic2mqtt.service
 """
 
+import base64
 import json
+import secrets
+import signal
 import ssl
+import sys
 import time
 import logging
 import datetime
@@ -63,7 +79,7 @@ from meshtastic.ble_interface import BLEInterface
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan`; may work with BLE name
+BLE_TARGET = "DE:AD:BE:EF:DE:ED" # BLE MAC address from `meshtastic --ble-scan`; may work with BLE name
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 MQTT_USER = None                 # or "user" if mosquitto requires auth
@@ -132,6 +148,33 @@ def _get_firmware(interface):
 # NeighborInfo packets (needs the neighborinfo module enabled on the
 # nodes) feed a topology map: source node id -> list of edges
 MESH_TOPOLOGY = {}
+
+# Pending confirmation nonce for meshtastic/bridge/set/channel.
+# Channel imports replace channels AND LoRa settings
+# -> so we require a two-step confirmation
+CHANNEL_CHALLENGE = {"nonce": None, "expires": 0.0}
+CHANNEL_CHALLENGE_TTL = 600  # seconds
+
+
+def _channelset_region(url):
+    """Best-effort: pull the LoRa region out of a channel URL
+    (https://meshtastic.org/e/#<base64url ChannelSet>). Returns None
+    if the payload can't be parsed — callers treat that as 'unknown'
+    and don't block on it."""
+    try:
+        from meshtastic.protobuf import apponly_pb2
+        frag = url.split("#", 1)[-1].split("?", 1)[0].strip()
+        pad = "=" * (-len(frag) % 4)
+        blob = base64.urlsafe_b64decode(frag + pad)
+        cs = apponly_pb2.ChannelSet()
+        cs.ParseFromString(blob)
+        for attr in ("lora_config", "loRaConfig", "loraConfig"):
+            lora = getattr(cs, attr, None)
+            if lora is not None and lora.HasField("region"):
+                return int(lora.region)
+    except Exception:
+        pass
+    return None
 
 
 def on_packet(packet, interface):
@@ -260,7 +303,7 @@ def on_mqtt_message(client, userdata, msg):
         # Only react to requests and outbound texts; ignore our own
         # publishes (status/heartbeat/resp) that we receive back on
         # the meshtastic/bridge/# subscription.
-        if len(parts) < 3 or parts[2] not in ("get", "to"):
+        if len(parts) < 3 or parts[2] not in ("get", "to", "set"):
             return
 
         # meshtastic/bridge/get/<field> -> query local node info
@@ -365,6 +408,29 @@ def on_mqtt_message(client, userdata, msg):
                     retain=True,
                 )
                 return
+            # meshtastic/bridge/get/channel -> share URL for this
+            # node's channel (the content a QR code would encode)
+            if field == "channel":
+                url = userdata["interface"].localNode.getURL()
+                client.publish(
+                    f"{TOPIC_PREFIX}/resp/channel", url, retain=True
+                )
+                return
+            # meshtastic/bridge/get/channelchallenge -> one-time nonce
+            # for set/channel (valid CHANNEL_CHALLENGE_TTL seconds,
+            # NOT retained: read it live or lose it)
+            if field == "channelchallenge":
+                nonce = secrets.token_hex(3)
+                CHANNEL_CHALLENGE["nonce"] = nonce
+                CHANNEL_CHALLENGE["expires"] = (
+                    time.time() + CHANNEL_CHALLENGE_TTL
+                )
+                client.publish(
+                    f"{TOPIC_PREFIX}/resp/channelchallenge",
+                    nonce,
+                    retain=False,
+                )
+                return
             try:
                 my = userdata["interface"].getMyNodeInfo()
                 metrics = my.get("deviceMetrics") or {}
@@ -385,6 +451,66 @@ def on_mqtt_message(client, userdata, msg):
                 )
             except Exception as e:
                 client.publish(f"{TOPIC_PREFIX}/resp/{field}", f"error: {e}")
+            return
+
+        # meshtastic/bridge/set/channel -> import a channel URL.
+        # Two-step safety: get/channelchallenge first, then publish
+        # JSON {"url": ..., "confirm": "<nonce>"} here. The node
+        # reboots itself to apply the new channel set; the bridge's
+        # reconnect loop handles the BLE dropout automatically.
+        if parts[2] == "set" and len(parts) >= 4 and parts[3] == "channel":
+            result = f"{TOPIC_PREFIX}/resp/channel/result"
+            try:
+                body = json.loads(payload)
+                url = str(body["url"])
+                confirm = str(body.get("confirm", ""))
+            except Exception:
+                client.publish(
+                    result,
+                    'invalid payload - expected JSON {"url": ..., "confirm": ...}',
+                    retain=True,
+                )
+                return
+            nonce = CHANNEL_CHALLENGE["nonce"]
+            if (
+                not nonce
+                or confirm != nonce
+                or time.time() > CHANNEL_CHALLENGE["expires"]
+            ):
+                client.publish(
+                    result,
+                    "challenge missing or expired - request get/channelchallenge first",
+                    retain=True,
+                )
+                return
+            # Region guard: refuse channel sets that would move the
+            # node to another LoRa region (silent mesh split).
+            new_region = _channelset_region(url)
+            if new_region is not None:
+                try:
+                    cur_region = int(
+                        userdata["interface"].localNode.localConfig.lora.region
+                    )
+                    if new_region != cur_region:
+                        client.publish(
+                            result,
+                            f"refused: URL uses region {new_region}, "
+                            f"node is on {cur_region}",
+                            retain=True,
+                        )
+                        return
+                except Exception:
+                    pass  # current region unknown - don't block
+            try:
+                userdata["interface"].localNode.setURL(url)
+                client.publish(
+                    result,
+                    "channel set - node will reboot to apply",
+                    retain=True,
+                )
+                log.info("Channel set imported via set/channel: %s", url)
+            except Exception as e:
+                client.publish(result, f"error: {e}", retain=True)
             return
 
         # meshtastic/bridge/to/<nodeid>/text -> send text onto the mesh
@@ -412,7 +538,30 @@ mqttc.on_message = on_mqtt_message
 # --------------------------------------------------------------------------
 # BLE connect loop with auto-reconnect
 # --------------------------------------------------------------------------
+CURRENT_IFACE = {"iface": None}
+
+def _handle_sigterm(signum, frame):
+    """Close the BLE link cleanly on stop signals so the node
+    resumes advertising immediately instead of hanging."""
+    log.info("Signal %s - closing BLE connection cleanly", signum)
+    iface = CURRENT_IFACE["iface"]
+    if iface is not None:
+        try:
+            iface.close()  # proper GATT disconnect
+        except Exception:
+            pass
+    try:
+        publish(f"{TOPIC_PREFIX}/status", "offline", retain=True)
+        mqttc.loop_stop()
+    except Exception:
+        pass
+    sys.exit(0)
+
+
 def run_bridge():
+    # systemd stop = SIGTERM: make sure the BLE link is closed cleanly
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
     mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
     mqttc.loop_start()
     mqttc.subscribe(f"{TOPIC_PREFIX}/#", qos=1)
@@ -428,6 +577,7 @@ def run_bridge():
         try:
             log.info("Connecting to BLE device %s ...", BLE_TARGET)
             iface = BLEInterface(BLE_TARGET)
+            CURRENT_IFACE["iface"] = iface
             mqttc.user_data_set({"interface": iface})
 
             # Publish local node info (firmware, battery, voltage) once
@@ -478,6 +628,7 @@ def run_bridge():
 
         except Exception as e:
             log.error("BLE connection error: %s", e)
+            CURRENT_IFACE["iface"] = None
             try:
                 if iface:
                     iface.close()
