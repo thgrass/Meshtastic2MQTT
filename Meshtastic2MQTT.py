@@ -125,6 +125,19 @@ def publish(topic, payload, retain=False):
         log.error("MQTT publish failed: %s", e)
 
 
+def _json_dump(obj):
+    """json.dumps that can't fail: protobuf leftovers such as raw
+    bytes become hex strings instead of raising TypeError — an
+    exception here would silently kill ALL publishing for that
+    packet (json + telemetry + chat)."""
+    return json.dumps(
+        obj,
+        default=lambda o: (
+            o.hex() if isinstance(o, (bytes, bytearray)) else str(o)
+        ),
+    )
+
+
 # --------------------------------------------------------------------------
 # Meshtastic packet -> MQTT topics
 # --------------------------------------------------------------------------
@@ -150,8 +163,8 @@ def _get_firmware(interface):
 MESH_TOPOLOGY = {}
 
 # Pending confirmation nonce for meshtastic/bridge/set/channel.
-# Channel imports replace channels AND LoRa settings
-# -> so we require a two-step confirmation
+# Channel imports are powerful: they replace channels AND LoRa
+# settings (node reboots) — so they need a two-step confirmation.
 CHANNEL_CHALLENGE = {"nonce": None, "expires": 0.0}
 CHANNEL_CHALLENGE_TTL = 600  # seconds
 
@@ -184,11 +197,15 @@ def on_packet(packet, interface):
         decoded = packet.get("decoded", {})
         ptype = decoded.get("portnum", decoded.get("type"))
 
+        # One journal line per received packet: makes "is anything
+        # arriving at all?" answerable from journalctl alone.
+        log.info("RX packet type=%s from=%s", ptype, nodeid)
+
         # Only publish the raw JSON when there is actual content —
         # routing ACKs etc. carry an empty decoded dict and would
         # otherwise flood the broker with '{}' messages.
         if decoded:
-            publish(f"{NODE_TOPIC_PREFIX}/{nodeid}/json", json.dumps(decoded))
+            publish(f"{NODE_TOPIC_PREFIX}/{nodeid}/json", _json_dump(decoded))
 
         # Telemetry (environment, power, device metrics, air quality...)
         telemetry = decoded.get("telemetry")
@@ -205,7 +222,7 @@ def on_packet(packet, interface):
                         )
                 publish(
                     f"{NODE_TOPIC_PREFIX}/{nodeid}/telemetry/{ttype}/json",
-                    json.dumps(values),
+                    _json_dump(values),
                     retain=True,
                 )
 
@@ -376,7 +393,7 @@ def on_mqtt_message(client, userdata, msg):
                     client.publish(resp_topic, "unknown node", retain=True)
                     return
                 if nfield == "all":
-                    client.publish(resp_topic, json.dumps(entry), retain=True)
+                    client.publish(resp_topic, _json_dump(entry), retain=True)
                     return
                 user = entry.get("user") or {}
                 metrics = entry.get("deviceMetrics") or {}
@@ -538,7 +555,13 @@ mqttc.on_message = on_mqtt_message
 # --------------------------------------------------------------------------
 # BLE connect loop with auto-reconnect
 # --------------------------------------------------------------------------
+# Live reference to the current interface so the SIGTERM handler can
+# close it. `systemctl stop` sends SIGTERM; without a handler Python
+# is killed instantly with NO GATT disconnect, and the nRF52 then
+# sometimes stays "connected" (a connected peripheral stops
+# advertising!) until the node is rebooted.
 CURRENT_IFACE = {"iface": None}
+
 
 def _handle_sigterm(signum, frame):
     """Close the BLE link cleanly on stop signals so the node
