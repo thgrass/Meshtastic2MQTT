@@ -2,7 +2,7 @@
 
 A small Python script that connects a [Meshtastic](https://meshtastic.org) node over Bluetooth LE and bridges it to a local MQTT broker - so Home Assistant, Node-RED, Grafana or anything else on your LAN can read the mesh and talk back to it.
 
-Written for a Raspberry Pi and a solar-powered SenseCAP node, but it should work with any Meshtastic device that exposes BLE (T-Beam, RAK, Heltec, etc.).
+Written for a Raspberry Pi 4 and a solar-powered SenseCAP node, but it should work with any Meshtastic device that exposes BLE (T-Beam, RAK, Heltec, etc.).
 
 ## What it does
 
@@ -89,9 +89,9 @@ Fields: `batteryLevel`, `voltage`, `channelUtilization`, `airUtilTx`, `uptimeSec
 
 `get/channel` publishes the share URL for your node's channel on `meshtastic/bridge/resp/channel` - the exact content a Meshtastic QR code encodes. Render it into a QR with any generator, or open it on a phone with the app installed.
 
-`set/channel` imports one — the reverse direction: publish JSON `{"url": "<channel URL>", "confirm": "<nonce>"}` to `meshtastic/bridge/set/channel`. Get the nonce first via `get/channelchallenge` (delivered on `resp/channelchallenge`, valid 10 min). The result lands retained on `meshtastic/bridge/resp/channel/result`. **This replaces the node's channels and LoRa settings completely** - the node reboots itself, and the bridge's reconnect loop handles the BLE dropout. Two safety rails: the challenge nonce stops a stray MQTT message from reconfiguring your radio, and the bridge refuses imports that would change the LoRa region (which would silently split your mesh).
+`set/channel` imports one - the reverse direction: publish JSON `{"url": "<channel URL>", "confirm": "<nonce>"}` to `meshtastic/bridge/set/channel`. Get the nonce first via `get/channelchallenge` (delivered on `resp/channelchallenge`, valid 10 min). The result lands retained on `meshtastic/bridge/resp/channel/result`. **This replaces the node's channels and LoRa settings completely** - the node reboots itself, and the bridge's reconnect loop handles the BLE dropout. Two safety rails: the challenge nonce stops a stray MQTT message from reconfiguring your radio, and the bridge refuses imports that would change the LoRa region (which would silently split your mesh).
 
-`get/traceroute/<id>` makes a specific remote node answer with its route through the mesh - the MQTT-native way to verify your own sending works end to end, no human on the other end needed: the target node replies on its own, so a route response proves your TX and RX across the whole path. Result retained on `meshtastic/bridge/resp/traceroute`: `pending` → `ok` (each hop's node ID and SNR) → or `timeout`/`failed` (no working path right now). Optional hop limit 1–7 as a suffix: `get/traceroute/<id>/5`.
+`get/traceroute/<id>` makes a specific remote node answer with its route through the mesh - the MQTT-native way to verify your own sending works end to end, no human on the other end needed: the target node replies on its own, so a route response proves your TX and RX across the whole path. Result retained on `meshtastic/bridge/resp/traceroute`: `pending` → `ok` (each hop's node ID and SNR) → or `timeout`/`failed` (no working path right now). Optional hop limit 1-7 as a suffix: `get/traceroute/<id>/5`.
 
 **MQTT sensors → mesh telemetry:** the bridge watches every topic in the `FORWARD_TOPICS` mapping and broadcasts the values as genuine `EnvironmentTelemetry` - remote nodes and apps then show your node as a sensor node. One packet every 15 minutes carries *all* current values, exactly like a real BME280 node. Two entry forms: `"topic": "temperature"` for topics whose payload is a bare number, or - the zigbee2mqtt case - `"zigbee2mqtt/<device>": {"temperature": "temperature", "humidity": "relative_humidity"}`, which maps the JSON keys of the device message straight to mesh fields (pick any subset; `battery`/`linkquality` etc. are ignored). Mesh etiquette is built in: at most one packet per 15 minutes and only when some value moved ≥ 0.3 (`FORWARD_MIN_INTERVAL` / `FORWARD_DEADBAND` constants at the top of the script; empty the dict to disable). These values can be changed in the script. The injected values are additionally published locally on `meshtastic/node/<this-node>/telemetry/environmentMetrics/<field>` (retained).
 
@@ -167,7 +167,7 @@ mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/topology' -C 1 > topology.
 - `nodes.json` - every node with `lat`/`lon`/`alt` (if it broadcasts GPS), name, battery, `snr`, `lastHeard`
 - `topology.json` - edge list `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`
 
-Join both on `id` and you have a geographic graph: nodes at their real positions, edges between them, SNR as color or line thickness. Drops straight into Leaflet, D3, Graphviz or Python's `networkx`.
+Join both on `id` and you may have a geographic graph: nodes at their real positions, edges between them, SNR as color or line thickness.
 
 Two caveats:
 
