@@ -1,6 +1,6 @@
 # Meshtastic2MQTT
 
-A small Python script that connects a [Meshtastic](https://meshtastic.org) node over Bluetooth LE and bridges it to a local MQTT broker - so Home Assistant, Node-RED, Grafana or anything else on your LAN can read the mesh and talk back to it.
+A small Python script that connects a [Meshtastic](https://meshtastic.org) node over Bluetooth LE and bridges it to a local MQTT broker — so Home Assistant, Node-RED, Grafana or anything else on your LAN can read the mesh and talk back to it.
 
 Written for a Raspberry Pi and a solar-powered SenseCAP node, but it should work with any Meshtastic device that exposes BLE (T-Beam, RAK, Heltec, etc.).
 
@@ -32,7 +32,7 @@ python3 -m venv ~/bridge-venv
    ~/bridge-venv/bin/meshtastic --ble-scan
    ```
 
-2. Pair it once (this matters - the lib reuses the stored pairing keys):
+2. Pair it once (this matters — the lib reuses the stored pairing keys):
 
    ```bash
    bluetoothctl
@@ -62,7 +62,7 @@ python3 -m venv ~/bridge-venv
 | `meshtastic/node/<id>/text` | plain text message from that node |
 | `meshtastic/node/<id>/json` | raw decoded packet (only if non-empty) |
 | `meshtastic/chat` | every text message: `{"fromId", "fromName", "to": "all"\|"you", "channel", "text"}` |
-| `meshtastic/chat/dm` | only DMs addressed to your node - handy for push notifications |
+| `meshtastic/chat/dm` | only DMs addressed to your node — handy for push notifications |
 | `meshtastic/bridge/status` | `online` / `offline` (retained, Last Will) |
 | `meshtastic/bridge/heartbeat` | ISO timestamp every 60 s |
 
@@ -81,15 +81,21 @@ python3 -m venv ~/bridge-venv
 
 Fields: `batteryLevel`, `voltage`, `channelUtilization`, `airUtilTx`, `uptimeSeconds`, `firmwareVersion`, `longName`, `shortName`.
 
-`get/nodes` is special: it returns the full mesh node list as JSON on `meshtastic/bridge/resp/nodes` - one entry per node with `id`, `longName`, `shortName`, `hwModel`, `batteryLevel`, `lastHeard` (Unix time), `snr` and, if the node broadcasts GPS, `lat`/`lon`/`alt`. That's everything you need to draw a map of your mesh, without ever disconnecting the bridge to run `meshtastic --nodes`.
+`get/nodes` is special: it returns the full mesh node list as JSON on `meshtastic/bridge/resp/nodes` — one entry per node with `id`, `longName`, `shortName`, `hwModel`, `batteryLevel`, `lastHeard` (Unix time), `snr` and, if the node broadcasts GPS, `lat`/`lon`/`alt`. That's everything you need to draw a map of your mesh, without ever disconnecting the bridge to run `meshtastic --nodes`.
 
-`get/topology` returns the mesh's link graph as JSON on `meshtastic/bridge/resp/topology`, shaped like `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`. It fills up from NeighborInfo packets - enable the module on your node (and ideally your neighbors') with `meshtastic --set neighbor_info.enabled true` (stop the bridge first; only one client can use the node at a time). Until nodes have it enabled, the answer stays `{}`.
+`get/topology` returns the mesh's link graph as JSON on `meshtastic/bridge/resp/topology`, shaped like `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`. It fills up from NeighborInfo packets — enable the module on your node (and ideally your neighbors') with `meshtastic --set neighbor_info.enabled true` (stop the bridge first; only one client can use the node at a time). Until nodes have it enabled, the answer stays `{}`.
 
-`get/node/<id>/<field>` queries a single remote node from the node DB - e.g. `get/node/1fa0034c/batteryLevel`. Fields: `longName`, `shortName`, `hwModel`, `batteryLevel`, `voltage`, `channelUtilization`, `airUtilTx`, `uptimeSeconds`, `snr`, `lastHeard`, `lat`, `lon`, `alt`, or `all` for the full DB entry as JSON. The answer arrives retained on `meshtastic/bridge/resp/node/<id>/<field>`. Values are as fresh as the last packet your node heard from that node - minutes for chatty neighbors, hours for quiet ones.
+`get/node/<id>/<field>` queries a single remote node from the node DB — e.g. `get/node/1fa0034c/batteryLevel`. Fields: `longName`, `shortName`, `hwModel`, `batteryLevel`, `voltage`, `channelUtilization`, `airUtilTx`, `uptimeSeconds`, `snr`, `lastHeard`, `lat`, `lon`, `alt`, or `all` for the full DB entry as JSON. The answer arrives retained on `meshtastic/bridge/resp/node/<id>/<field>`. Values are as fresh as the last packet your node heard from that node — minutes for chatty neighbors, hours for quiet ones.
 
-`get/channel` publishes the share URL for your node's channel on `meshtastic/bridge/resp/channel` - the exact content a Meshtastic QR code encodes. Render it into a QR with any generator, or open it on a phone with the app installed.
+`get/channel` publishes the share URL for your node's channel on `meshtastic/bridge/resp/channel` — the exact content a Meshtastic QR code encodes. Render it into a QR with any generator, or open it on a phone with the app installed.
 
-`set/channel` imports one - the reverse direction: publish JSON `{"url": "<channel URL>", "confirm": "<nonce>"}` to `meshtastic/bridge/set/channel`. Get the nonce first via `get/channelchallenge` (delivered on `resp/channelchallenge`, valid 10 min). The result lands retained on `meshtastic/bridge/resp/channel/result`. **This replaces the node's channels and LoRa settings completely** - the node reboots itself, and the bridge's reconnect loop handles the BLE dropout. Two safety rails: the challenge nonce stops a stray MQTT message from reconfiguring your radio, and the bridge refuses imports that would change the LoRa region (which would silently split your mesh).
+`set/channel` imports one — the reverse direction: publish JSON `{"url": "<channel URL>", "confirm": "<nonce>"}` to `meshtastic/bridge/set/channel`. Get the nonce first via `get/channelchallenge` (delivered on `resp/channelchallenge`, valid 10 min). The result lands retained on `meshtastic/bridge/resp/channel/result`. **This replaces the node's channels and LoRa settings completely** — the node reboots itself, and the bridge's reconnect loop handles the BLE dropout. Two safety rails: the challenge nonce stops a stray MQTT message from reconfiguring your radio, and the bridge refuses imports that would change the LoRa region (which would silently split your mesh).
+
+`get/traceroute/<id>` makes a specific remote node answer with its route through the mesh — the MQTT-native way to verify your own sending works end to end, no human on the other end needed: the target node replies on its own, so a route response proves your TX and RX across the whole path. Result retained on `meshtastic/bridge/resp/traceroute`: `pending` → `ok` (each hop's node ID and SNR) → or `timeout`/`failed` (no working path right now). Optional hop limit 1–7 as a suffix: `get/traceroute/<id>/5`.
+
+**HA sensor → mesh telemetry:** the bridge watches `home/sht15_rpi/temperature` (your Home Assistant automation republishes `sensor.sht15_rpi` there — or point `FORWARD_TOPIC` at any existing MQTT topic) and broadcasts it as genuine `EnvironmentTelemetry`: remote nodes and apps then show your node as a temperature-sensing node. Mesh etiquette is built in — at most one packet per 15 minutes and only when the value moved ≥ 0.3 °C (`FORWARD_MIN_INTERVAL` / `FORWARD_DEADBAND` constants at the top of the script; set `FORWARD_TOPIC = ""` to disable).
+
+**Store & Forward replays, unwrapped:** a Store & Forward server (a community router, recognizable by its `STORE_FORWARD_APP` heartbeats every 15 min) answers a DM containing the text `SF` by replaying the public broadcast chatter of roughly the last 4 hours — one message every 5 s. Over the mesh those replays arrive wrapped in `STORE_FORWARD_APP` packets; the bridge unwraps them, so they appear as normal entries on `meshtastic/chat` (broadcasts) and `meshtastic/chat/dm` (DMs), correctly attributed to their original senders. Note: the server never replays your *own* messages back to you, and only what it heard while it was online.
 
 ## Try it
 
@@ -115,7 +121,7 @@ mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | \
 mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | \
   jq -r '.[] | select(.lat) | "\(.id) \(.longName) \(.lat),\(.lon)"'
 
-# mesh topology - who hears whom (needs neighborinfo enabled on nodes)
+# mesh topology — who hears whom (needs neighborinfo enabled on nodes)
 mosquitto_pub -h localhost -t 'meshtastic/bridge/get/topology' -n
 mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/topology' -C 1 | jq .
 
@@ -134,6 +140,14 @@ mosquitto_pub -h localhost -t 'meshtastic/bridge/set/channel' \
   -m '{"url": "https://meshtastic.org/e/#GAMi...", "confirm": "<nonce>"}'
 mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/channel/result' -C 1
 
+# verify two-way delivery to a specific node (node answers by itself)
+mosquitto_pub -h localhost -t 'meshtastic/bridge/get/traceroute/aa98a368' -n
+sleep 30
+mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/traceroute' -C 1 | jq .
+
+# forward a test temperature (first value broadcasts immediately)
+mosquitto_pub -h localhost -t 'home/sht15_rpi/temperature' -m '21.7'
+
 # say hello to everyone
 mosquitto_pub -h localhost -t 'meshtastic/bridge/to/all/text' -m 'hello mesh'
 ```
@@ -150,15 +164,15 @@ mosquitto_pub -h localhost -t 'meshtastic/bridge/get/topology' -n
 mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/topology' -C 1 > topology.json
 ```
 
-- `nodes.json` - every node with `lat`/`lon`/`alt` (if it broadcasts GPS), name, battery, `snr`, `lastHeard`
-- `topology.json` - edge list `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`
+- `nodes.json` — every node with `lat`/`lon`/`alt` (if it broadcasts GPS), name, battery, `snr`, `lastHeard`
+- `topology.json` — edge list `{"<source-id>": [{"to": "<peer-id>", "snr": -8.25}, ...]}`
 
 Join both on `id` and you have a geographic graph: nodes at their real positions, edges between them, SNR as color or line thickness. Drops straight into Leaflet, D3, Graphviz or Python's `networkx`.
 
 Two caveats:
 
 - Nodes without GPS stay off the map (they're still in the node list, just without coordinates).
-- The topology only fills up if nodes broadcast NeighborInfo (see `get/topology` above). Until then the only link data you have is the `snr` values in `nodes.json` - how well *your* node hears each sender.
+- The topology only fills up if nodes broadcast NeighborInfo (see `get/topology` above). Until then the only link data you have is the `snr` values in `nodes.json` — how well *your* node hears each sender.
 
 Since both `resp` topics are retained, a cron job that re-issues the two gets and stores the answers gives you a history of your mesh's shape for free.
 
@@ -184,8 +198,8 @@ Wire `meshtastic/chat/dm` to a notification automation if you want a ping when s
 
 - Battery and friends refresh when the node broadcasts nodeinfo (every ~3 h by default). For hourly updates, enable device telemetry on the node (`telemetry.device_telemetry_enabled`) and set `device_update_interval`.
 - Meshtastic is best-effort: broadcasts aren't guaranteed to reach every node, and this bridge can't change that.
-- Only one client can talk to the node at a time - don't run this while also running `meshtastic` CLI against the same node or having your phone connected.
+- Only one client can talk to the node at a time — don't run this while also running `meshtastic` CLI against the same node or having your phone connected.
 
 ## License
 
-MIT - do whatever you want, no warranty. Tested with firmware 2.7.x and me
+MIT — do whatever you want, no warranty. Tested with firmware 2.7.x and meshtastic-python 2.x; PRs welcome.
