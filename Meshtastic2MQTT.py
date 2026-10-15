@@ -34,7 +34,13 @@ Forward Home Assistant sensors to the mesh (LAN -> mesh):
   carries all current values, and only on changes of at least
   FORWARD_DEADBAND — the mesh sees this node like a sensor node
   (fields: temperature, relative_humidity, barometric_pressure).
-  Empty FORWARD_TOPICS disables the feature.
+  Mapping forms: "topic": "field" for bare-number payloads, or
+  "topic": {"json_key": "field", ...} for JSON payloads
+  (zigbee2mqtt). Empty FORWARD_TOPICS disables the feature.
+  The injected values are ALSO published locally under
+  meshtastic/node/<thisnode>/telemetry/environmentMetrics/...
+  (receipt: the node cannot hear its own broadcasts, so the
+  received-packet stream never shows them).
 
 Get fields: batteryLevel, voltage, channelUtilization, airUtilTx,
 uptimeSeconds, firmwareVersion, longName, shortName,
@@ -108,22 +114,31 @@ NODE_TOPIC_PREFIX = "meshtastic/node"
 RECONNECT_DELAY = 5             # seconds between reconnect attempts
 HEARTBEAT_INTERVAL = 60         # seconds
 
-# ------- HA sensor -> mesh telemetry forwarding (LAN -> mesh) -------
-# The bridge watches every topic in FORWARD_TOPICS (e.g. HA
-# automations republishing sensors there, or zigbee2mqtt topics)
-# and broadcasts the values as genuine EnvironmentTelemetry — to
-# the mesh, this node then looks like a sensor node. ONE packet per
-# interval carries ALL current values, exactly like a real BME280
-# node sends temperature+humidity+pressure together. Etiquette
-# rails: at most one broadcast per FORWARD_MIN_INTERVAL seconds,
-# and only when at least one value moved >= FORWARD_DEADBAND.
-# Metric fields (Meshtastic environment metrics, snake_case):
-#   temperature, relative_humidity, barometric_pressure
-# Remove entries to forward fewer topics; empty dict disables all.
+# ------- MQTT sensor / zigbee2mqtt -> mesh telemetry forwarding -------
+# The bridge watches every topic in FORWARD_TOPICS and broadcasts the
+# values as genuine EnvironmentTelemetry — to the mesh, this node
+# then looks like a sensor node. ONE packet per interval carries ALL
+# current values, exactly like a real BME280 node sends
+# temperature+humidity+pressure together. Etiquette rails: at most
+# one broadcast per FORWARD_MIN_INTERVAL seconds, and only when at
+# least one value moved >= FORWARD_DEADBAND.
+# Two mapping forms per topic:
+#   bare-number payload:  "topic": "temperature"
+#   JSON payload (zigbee2mqtt!):
+#     "zigbee2mqtt/<device>": {"temperature": "temperature",
+#                              "humidity": "relative_humidity"}
+#   -> JSON keys of the device message mapped to mesh fields; pick
+#      any subset, other keys (battery, linkquality, ...) are
+#      ignored. Find your topics via
+#      `mosquitto_sub -t 'zigbee2mqtt/#' -v` or the Z2M frontend.
+# Mesh metric fields (snake_case): temperature, relative_humidity,
+#   barometric_pressure. Empty dict disables all forwarding.
 FORWARD_TOPICS = {
-    # "home/sht15_rpi/temperature": "temperature",
-    # "home/sht15_rpi/humidity": "relative_humidity",
-    # "home/outdoor/pressure": "barometric_pressure",
+    # zigbee2mqtt example — pick your device and the keys you need:
+    # "zigbee2mqtt/<your-device>": {
+    #     "temperature": "temperature",
+    #     "humidity": "relative_humidity",
+    # },
 }
 FORWARD_MIN_INTERVAL = 900      # seconds between broadcasts (15 min)
 FORWARD_DEADBAND = 0.3          # skip if no value changed this much
@@ -373,20 +388,56 @@ def on_packet(packet, interface):
 # --------------------------------------------------------------------------
 # MQTT -> mesh (requests + outbound text messages)
 # ---------------------------------------------------------------------------
-def _forward_telemetry(userdata, field, payload):
-    """Broadcast Home Assistant sensor values as EnvironmentTelemetry.
+def _to_camel(field):
+    """snake_case -> camelCase, so receipt topics match the keys the
+    bridge uses for received telemetry (relative_humidity ->
+    relativeHumidity) — automatically, for ANY field mapped in
+    FORWARD_TOPICS, without a hardcoded field list."""
+    first, *rest = field.split("_")
+    return first + "".join(part.capitalize() for part in rest)
 
-    Throttled (FORWARD_MIN_INTERVAL) + deadband (FORWARD_DEADBAND) so
-    the mesh sees this node exactly like a real sensor node: one
-    small packet every 15 minutes at most, none when nothing changed.
-    All current values ride together in that one packet."""
-    try:
-        value = float(payload)
-    except (ValueError, TypeError):
-        log.warning("Forward: non-numeric value for %s: %r", field, payload)
-        return
+
+def _forward_telemetry(userdata, mapping, topic, payload_str):
+    """Broadcast HA / zigbee2mqtt sensor values as EnvironmentTelemetry.
+
+    Two mapping forms per topic: a bare field name (payload must be
+    a bare number) or a dict {json_key: mesh_field} (payload is
+    JSON — the zigbee2mqtt device message). Throttled
+    (FORWARD_MIN_INTERVAL) + deadband (FORWARD_DEADBAND) so the mesh
+    sees this node exactly like a real sensor node: one small packet
+    every 15 minutes at most, none when nothing changed. All current
+    values ride together in that one packet."""
     state = FORWARD_STATE
-    state["values"][field] = value
+    # 1) decode the payload into {mesh_field: value} updates
+    if isinstance(mapping, str):
+        try:
+            updates = {mapping: float(payload_str)}
+        except (ValueError, TypeError):
+            log.warning(
+                "Forward: non-numeric payload on %s: %r", topic, payload_str
+            )
+            return
+    else:
+        try:
+            data = json.loads(payload_str)
+        except (ValueError, TypeError):
+            log.warning(
+                "Forward: non-JSON payload on %s: %r", topic, payload_str
+            )
+            return
+        if not isinstance(data, dict):
+            log.warning(
+                "Forward: unexpected JSON on %s: %r", topic, payload_str
+            )
+            return
+        updates = {}
+        for json_key, mesh_field in mapping.items():
+            if isinstance(data.get(json_key), (int, float)):
+                updates[mesh_field] = float(data[json_key])
+        if not updates:
+            return  # e.g. availability message: nothing useful inside
+    # 2) cache + throttle/deadband + one combined broadcast
+    state["values"].update(updates)
     values = state["values"]
     changed = any(
         f not in state["sent"]
@@ -409,6 +460,24 @@ def _forward_telemetry(userdata, field, payload):
             "Forwarded telemetry to the mesh: %s",
             ", ".join(f"{f}={v:.2f}" for f, v in values.items()),
         )
+        # Local receipt: the node cannot hear its own broadcasts, so
+        # the injected values never appear in the received-packet
+        # stream. Publish them on this node's own telemetry topics,
+        # same shape as received environmentMetrics — so Home
+        # Assistant treats them like any other node's sensors and
+        # the forwarding is verifiable locally.
+        try:
+            my = iface.getMyNodeInfo() or {}
+            myid = (my.get("user") or {}).get("id", "!unknown").lstrip("!")
+            # Receipt keys derive automatically from whatever fields
+            # FORWARD_TOPICS mapped — no hardcoded field list.
+            receipt = {_to_camel(f): v for f, v in values.items()}
+            base = f"{NODE_TOPIC_PREFIX}/{myid}/telemetry/environmentMetrics"
+            for k, v in receipt.items():
+                publish(f"{base}/{k}", round(float(v), 2), retain=True)
+            publish(f"{base}/json", _json_dump(receipt), retain=True)
+        except Exception as e:
+            log.error("Forward: receipt publish failed: %s", e)
     except Exception as e:
         log.error("Forward: telemetry broadcast failed: %s", e)
 
@@ -417,12 +486,14 @@ def on_mqtt_message(client, userdata, msg):
     """Handle requests on meshtastic/bridge/get/... and text messages on
     meshtastic/bridge/to/.../text."""
     try:
-        # HA sensor -> mesh telemetry forwarding — handled before the
-        # bridge/# filter below, because the FORWARD_TOPICS live
-        # outside meshtastic/... on the broker.
-        field = FORWARD_TOPICS.get(msg.topic)
-        if field is not None:
-            _forward_telemetry(userdata, field, msg.payload.decode("utf-8"))
+        # HA sensor / zigbee2mqtt -> mesh telemetry forwarding —
+        # handled before the bridge/# filter below, because the
+        # FORWARD_TOPICS live outside meshtastic/... on the broker.
+        mapping = FORWARD_TOPICS.get(msg.topic)
+        if mapping is not None:
+            _forward_telemetry(
+                userdata, mapping, msg.topic, msg.payload.decode("utf-8")
+            )
             return
 
         payload = msg.payload.decode("utf-8")
