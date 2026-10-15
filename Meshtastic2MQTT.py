@@ -28,12 +28,13 @@ Send text to the mesh (LAN -> mesh):
   meshtastic/bridge/to/all/text                  -> broadcast on default channel
   meshtastic/bridge/to/<hex-nodeid>/text         -> direct message to one node
 
-Forward a Home Assistant sensor to the mesh (LAN -> mesh):
-  FORWARD_TOPIC (default: home/sht15_rpi/temperature) is watched and
-  broadcast as EnvironmentTelemetry, throttled to one packet per
-  FORWARD_MIN_INTERVAL (15 min) and only on changes of at least
-  FORWARD_DEADBAND — the mesh sees this node like a sensor node.
-  Set FORWARD_TOPIC = "" to disable.
+Forward Home Assistant sensors to the mesh (LAN -> mesh):
+  every topic in FORWARD_TOPICS is watched and broadcast as
+  EnvironmentTelemetry; one packet per FORWARD_MIN_INTERVAL (15 min)
+  carries all current values, and only on changes of at least
+  FORWARD_DEADBAND — the mesh sees this node like a sensor node
+  (fields: temperature, relative_humidity, barometric_pressure).
+  Empty FORWARD_TOPICS disables the feature.
 
 Get fields: batteryLevel, voltage, channelUtilization, airUtilTx,
 uptimeSeconds, firmwareVersion, longName, shortName,
@@ -96,7 +97,7 @@ from meshtastic.protobuf import portnums_pb2, telemetry_pb2
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan; may work with BLE name
+BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan`; may work with BLE name
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 MQTT_USER = None                 # or "user" if mosquitto requires auth
@@ -108,17 +109,25 @@ RECONNECT_DELAY = 5             # seconds between reconnect attempts
 HEARTBEAT_INTERVAL = 60         # seconds
 
 # ------- HA sensor -> mesh telemetry forwarding (LAN -> mesh) -------
-# The bridge watches FORWARD_TOPIC (e.g. a Home Assistant automation
-# republishing sensor.sht15_rpi there, or a zigbee2mqtt topic) and
-# broadcasts the value as genuine EnvironmentTelemetry. To the mesh,
-# this node then looks exactly like a sensor node. Etiquette rails:
-# at most one broadcast per FORWARD_MIN_INTERVAL seconds, and only
-# when the value moved at least FORWARD_DEADBAND. Set FORWARD_TOPIC
-# to "" to disable the feature completely.
-FORWARD_TOPIC = ""
+# The bridge watches every topic in FORWARD_TOPICS (e.g. HA
+# automations republishing sensors there, or zigbee2mqtt topics)
+# and broadcasts the values as genuine EnvironmentTelemetry — to
+# the mesh, this node then looks like a sensor node. ONE packet per
+# interval carries ALL current values, exactly like a real BME280
+# node sends temperature+humidity+pressure together. Etiquette
+# rails: at most one broadcast per FORWARD_MIN_INTERVAL seconds,
+# and only when at least one value moved >= FORWARD_DEADBAND.
+# Metric fields (Meshtastic environment metrics, snake_case):
+#   temperature, relative_humidity, barometric_pressure
+# Remove entries to forward fewer topics; empty dict disables all.
+FORWARD_TOPICS = {
+    # "home/sht15_rpi/temperature": "temperature",
+    # "home/sht15_rpi/humidity": "relative_humidity",
+    # "home/outdoor/pressure": "barometric_pressure",
+}
 FORWARD_MIN_INTERVAL = 900      # seconds between broadcasts (15 min)
-FORWARD_DEADBAND = 0.3          # deg C: skip if the change is smaller
-FORWARD_STATE = {"value": None, "sent_at": 0.0, "sent_val": None}
+FORWARD_DEADBAND = 0.3          # skip if no value changed this much
+FORWARD_STATE = {"values": {}, "sent": {}, "sent_at": 0.0}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -364,37 +373,42 @@ def on_packet(packet, interface):
 # --------------------------------------------------------------------------
 # MQTT -> mesh (requests + outbound text messages)
 # ---------------------------------------------------------------------------
-def _forward_telemetry(userdata, payload):
-    """Broadcast a Home Assistant sensor value as EnvironmentTelemetry.
+def _forward_telemetry(userdata, field, payload):
+    """Broadcast Home Assistant sensor values as EnvironmentTelemetry.
 
     Throttled (FORWARD_MIN_INTERVAL) + deadband (FORWARD_DEADBAND) so
     the mesh sees this node exactly like a real sensor node: one
-    small packet every 15 minutes at most, none when nothing changed."""
+    small packet every 15 minutes at most, none when nothing changed.
+    All current values ride together in that one packet."""
     try:
         value = float(payload)
     except (ValueError, TypeError):
-        log.warning(
-            "Forward: non-numeric payload on %s: %r", FORWARD_TOPIC, payload
-        )
+        log.warning("Forward: non-numeric value for %s: %r", field, payload)
         return
     state = FORWARD_STATE
-    state["value"] = value
-    moved = (
-        state["sent_val"] is None
-        or abs(value - state["sent_val"]) >= FORWARD_DEADBAND
+    state["values"][field] = value
+    values = state["values"]
+    changed = any(
+        f not in state["sent"]
+        or abs(v - state["sent"][f]) >= FORWARD_DEADBAND
+        for f, v in values.items()
     )
     due = (time.time() - state["sent_at"]) >= FORWARD_MIN_INTERVAL
-    if not (moved and due):
+    if not (changed and due):
         return
     try:
         t = telemetry_pb2.Telemetry()
         t.time = int(time.time())
-        t.environment_metrics.temperature = round(value, 2)
+        for f, v in values.items():
+            setattr(t.environment_metrics, f, round(float(v), 2))
         iface = userdata["interface"]
         iface.sendData(t, BROADCAST_ADDR, portnums_pb2.PortNum.TELEMETRY_APP)
         state["sent_at"] = time.time()
-        state["sent_val"] = value
-        log.info("Forwarded temperature=%.2f to the mesh", value)
+        state["sent"] = dict(values)
+        log.info(
+            "Forwarded telemetry to the mesh: %s",
+            ", ".join(f"{f}={v:.2f}" for f, v in values.items()),
+        )
     except Exception as e:
         log.error("Forward: telemetry broadcast failed: %s", e)
 
@@ -404,10 +418,11 @@ def on_mqtt_message(client, userdata, msg):
     meshtastic/bridge/to/.../text."""
     try:
         # HA sensor -> mesh telemetry forwarding — handled before the
-        # bridge/# filter below, because FORWARD_TOPIC lives outside
-        # meshtastic/... on the broker.
-        if msg.topic == FORWARD_TOPIC:
-            _forward_telemetry(userdata, msg.payload.decode("utf-8"))
+        # bridge/# filter below, because the FORWARD_TOPICS live
+        # outside meshtastic/... on the broker.
+        field = FORWARD_TOPICS.get(msg.topic)
+        if field is not None:
+            _forward_telemetry(userdata, field, msg.payload.decode("utf-8"))
             return
 
         payload = msg.payload.decode("utf-8")
@@ -789,10 +804,14 @@ def run_bridge():
     mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
     mqttc.loop_start()
     mqttc.subscribe(f"{TOPIC_PREFIX}/#", qos=1)
-    if FORWARD_TOPIC:
+    for fwd_topic in FORWARD_TOPICS:
         # HA sensor -> mesh telemetry forwarding (see _forward_telemetry)
-        mqttc.subscribe(FORWARD_TOPIC, qos=1)
-        log.info("Telemetry forwarding enabled: watching %s", FORWARD_TOPIC)
+        mqttc.subscribe(fwd_topic, qos=1)
+    if FORWARD_TOPICS:
+        log.info(
+            "Telemetry forwarding enabled: watching %s",
+            ", ".join(FORWARD_TOPICS),
+        )
 
     # Attach the packet callback via pubsub (the lib's actual event
     # mechanism for received packets). Subscribe exactly ONCE, outside
