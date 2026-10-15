@@ -7,9 +7,10 @@ Written for a Raspberry Pi 4 and a solar-powered SenseCAP node, but it should wo
 ## What it does
 
 - Bridges every mesh packet to MQTT: telemetry, positions, text messages and node info
+- Sends sensor values from other MQTT sources via the telemetry app to the mesh
 - Publishes a clean chat stream that tells broadcasts and DMs apart
 - Lets you send text into the mesh via MQTT (broadcast or direct message)
-- Answers on-demand queries about the local node (battery, voltage, firmware...)
+- Answers MQTT on-demand queries about the local node (battery, voltage, firmware...)
 - Reconnects automatically when BLE drops, and announces itself dead via MQTT Last Will if it can't
 
 ## Requirements
