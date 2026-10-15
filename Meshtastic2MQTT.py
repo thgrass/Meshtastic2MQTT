@@ -20,10 +20,20 @@ Topic layout:
   meshtastic/chat                                -> every text message as JSON:
        {"fromId", "fromName", "to": "all"|"you", "channel", "text"}
   meshtastic/chat/dm                             -> only DMs addressed to this node
+  (Store & Forward replays are unwrapped: history messages that an
+  S&F router re-sends wrapped in STORE_FORWARD_APP appear as normal
+  entries on chat/chat/dm, attributed to their original senders)
 
 Send text to the mesh (LAN -> mesh):
   meshtastic/bridge/to/all/text                  -> broadcast on default channel
   meshtastic/bridge/to/<hex-nodeid>/text         -> direct message to one node
+
+Forward a Home Assistant sensor to the mesh (LAN -> mesh):
+  FORWARD_TOPIC (default: home/sht15_rpi/temperature) is watched and
+  broadcast as EnvironmentTelemetry, throttled to one packet per
+  FORWARD_MIN_INTERVAL (15 min) and only on changes of at least
+  FORWARD_DEADBAND — the mesh sees this node like a sensor node.
+  Set FORWARD_TOPIC = "" to disable.
 
 Get fields: batteryLevel, voltage, channelUtilization, airUtilTx,
 uptimeSeconds, firmwareVersion, longName, shortName,
@@ -37,7 +47,11 @@ get/node/<id>/<field> -> query one remote node from the node DB
 channel (share URL for this node's channel on .../resp/channel —
   this is the exact content a Meshtastic QR code encodes),
 channelchallenge (one-time nonce for set/channel, on
-  .../resp/channelchallenge, valid 10 minutes)
+  .../resp/channelchallenge, valid 10 minutes),
+traceroute: get/traceroute/<hexid>[/<hops 1-7>] -> force a remote
+  node to answer with its route through the mesh; verifies two-way
+  delivery end to end; result retained on .../resp/traceroute
+  (pending -> ok with hops+SNR, or failed/timeout)
 
 Set topic meshtastic/bridge/set/channel:
   Import a channel URL (from a QR code / channel link) into the
@@ -68,18 +82,21 @@ import secrets
 import signal
 import ssl
 import sys
+import threading
 import time
 import logging
 import datetime
 
 import paho.mqtt.client as mqtt
 from pubsub import pub
+from meshtastic import BROADCAST_ADDR
 from meshtastic.ble_interface import BLEInterface
+from meshtastic.protobuf import portnums_pb2, telemetry_pb2
 
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-BLE_TARGET = "DE:AD:BE:EF:DE:ED" # BLE MAC address from `meshtastic --ble-scan`; may work with BLE name
+BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan; may work with BLE name
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 MQTT_USER = None                 # or "user" if mosquitto requires auth
@@ -89,6 +106,19 @@ TOPIC_PREFIX = "meshtastic/bridge"
 NODE_TOPIC_PREFIX = "meshtastic/node"
 RECONNECT_DELAY = 5             # seconds between reconnect attempts
 HEARTBEAT_INTERVAL = 60         # seconds
+
+# ------- HA sensor -> mesh telemetry forwarding (LAN -> mesh) -------
+# The bridge watches FORWARD_TOPIC (e.g. a Home Assistant automation
+# republishing sensor.sht15_rpi there, or a zigbee2mqtt topic) and
+# broadcasts the value as genuine EnvironmentTelemetry. To the mesh,
+# this node then looks exactly like a sensor node. Etiquette rails:
+# at most one broadcast per FORWARD_MIN_INTERVAL seconds, and only
+# when the value moved at least FORWARD_DEADBAND. Set FORWARD_TOPIC
+# to "" to disable the feature completely.
+FORWARD_TOPIC = ""
+FORWARD_MIN_INTERVAL = 900      # seconds between broadcasts (15 min)
+FORWARD_DEADBAND = 0.3          # deg C: skip if the change is smaller
+FORWARD_STATE = {"value": None, "sent_at": 0.0, "sent_val": None}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -267,6 +297,26 @@ def on_packet(packet, interface):
                 MESH_TOPOLOGY[nodeid] = edges
 
         # Text messages + unified chat stream (broadcast vs DM)
+        # Store & Forward replays: over-the-mesh replays arrive
+        # wrapped in a STORE_FORWARD_APP packet; the embedded bytes
+        # are the original text. The S&F server already rewrites the
+        # packet envelope to the ORIGINAL sender, so the chat code
+        # below attributes the message correctly. Replays are always
+        # addressed to the requester, so _sf_broadcast preserves
+        # whether the ORIGINAL message was a broadcast or a DM.
+        if ptype == "STORE_FORWARD_APP":
+            sf = decoded.get("storeforward") or {}
+            if sf.get("rr") in ("ROUTER_TEXT_BROADCAST", "ROUTER_TEXT_DIRECT"):
+                embedded = sf.get("text")
+                if isinstance(embedded, (bytes, bytearray)) and embedded:
+                    decoded["text"] = embedded.decode("utf-8", "replace")
+                    decoded["_sf_broadcast"] = (
+                        sf.get("rr") == "ROUTER_TEXT_BROADCAST"
+                    )
+                    log.info(
+                        "S&F replay unwrapped (original sender %s)", nodeid
+                    )
+
         text = decoded.get("text")
         if text:
             publish(f"{NODE_TOPIC_PREFIX}/{nodeid}/text", text)
@@ -280,6 +330,10 @@ def on_packet(packet, interface):
                 bool(my_id)
                 and to_id.replace("!", "").lower() == my_id.replace("!", "").lower()
             )
+            # S&F replays are always addressed to the requesting node;
+            # the wrapper says whether the ORIGINAL was a broadcast.
+            if decoded.pop("_sf_broadcast", False):
+                is_dm = False
             # Human-readable sender name from the node DB, if known
             from_name = nodeid
             try:
@@ -310,10 +364,52 @@ def on_packet(packet, interface):
 # --------------------------------------------------------------------------
 # MQTT -> mesh (requests + outbound text messages)
 # ---------------------------------------------------------------------------
+def _forward_telemetry(userdata, payload):
+    """Broadcast a Home Assistant sensor value as EnvironmentTelemetry.
+
+    Throttled (FORWARD_MIN_INTERVAL) + deadband (FORWARD_DEADBAND) so
+    the mesh sees this node exactly like a real sensor node: one
+    small packet every 15 minutes at most, none when nothing changed."""
+    try:
+        value = float(payload)
+    except (ValueError, TypeError):
+        log.warning(
+            "Forward: non-numeric payload on %s: %r", FORWARD_TOPIC, payload
+        )
+        return
+    state = FORWARD_STATE
+    state["value"] = value
+    moved = (
+        state["sent_val"] is None
+        or abs(value - state["sent_val"]) >= FORWARD_DEADBAND
+    )
+    due = (time.time() - state["sent_at"]) >= FORWARD_MIN_INTERVAL
+    if not (moved and due):
+        return
+    try:
+        t = telemetry_pb2.Telemetry()
+        t.time = int(time.time())
+        t.environment_metrics.temperature = round(value, 2)
+        iface = userdata["interface"]
+        iface.sendData(t, BROADCAST_ADDR, portnums_pb2.PortNum.TELEMETRY_APP)
+        state["sent_at"] = time.time()
+        state["sent_val"] = value
+        log.info("Forwarded temperature=%.2f to the mesh", value)
+    except Exception as e:
+        log.error("Forward: telemetry broadcast failed: %s", e)
+
+
 def on_mqtt_message(client, userdata, msg):
     """Handle requests on meshtastic/bridge/get/... and text messages on
     meshtastic/bridge/to/.../text."""
     try:
+        # HA sensor -> mesh telemetry forwarding — handled before the
+        # bridge/# filter below, because FORWARD_TOPIC lives outside
+        # meshtastic/... on the broker.
+        if msg.topic == FORWARD_TOPIC:
+            _forward_telemetry(userdata, msg.payload.decode("utf-8"))
+            return
+
         payload = msg.payload.decode("utf-8")
         parts = msg.topic.split("/")
 
@@ -447,6 +543,111 @@ def on_mqtt_message(client, userdata, msg):
                     nonce,
                     retain=False,
                 )
+                return
+            # meshtastic/bridge/get/traceroute/<hexid>[/<hoplimit>]
+            # -> forces that node to answer with the route through
+            #    the mesh (the MQTT-native way to verify sending:
+            #    no human needed, the target node replies on its
+            #    own). Result retained on .../resp/traceroute:
+            #    pending -> ok (hops + SNR), failed or timeout.
+            if field == "traceroute":
+                if len(parts) < 5:
+                    return
+                dest = parts[4].replace("!", "").replace("0x", "").lower()
+                hop_limit = 3
+                if len(parts) > 5:
+                    try:
+                        hop_limit = min(7, max(1, int(parts[5])))
+                    except ValueError:
+                        pass
+                iface = userdata["interface"]
+                resp_topic = f"{TOPIC_PREFIX}/resp/traceroute"
+                state = {"done": False}
+
+                def _finish(body):
+                    if not state["done"]:
+                        state["done"] = True
+                        client.publish(
+                            resp_topic, _json_dump(body), retain=True
+                        )
+
+                def _on_trace(p):
+                    try:
+                        decoded = p.get("decoded", {})
+                        if decoded.get("portnum") == "ROUTING_APP":
+                            err = (decoded.get("routing") or {}).get(
+                                "errorReason"
+                            )
+                            _finish(
+                                {"result": "failed", "dest": dest,
+                                 "error": err}
+                            )
+                            return
+                        from meshtastic.protobuf import mesh_pb2
+                        from google.protobuf import json_format
+                        rd = mesh_pb2.RouteDiscovery()
+                        rd.ParseFromString(decoded.get("payload") or b"")
+                        rd_dict = json_format.MessageToDict(rd)
+                        frm = p.get("from")
+                        _finish({
+                            "result": "ok",
+                            "dest": dest,
+                            "from": (
+                                f"{frm:08x}" if isinstance(frm, int)
+                                else None
+                            ),
+                            "route": [
+                                f"{n:08x}" for n in rd_dict.get("route", [])
+                            ],
+                            "snrTowards": [
+                                s / 4
+                                for s in rd_dict.get("snrTowards", [])
+                            ],
+                            "routeBack": [
+                                f"{n:08x}"
+                                for n in rd_dict.get("routeBack", [])
+                            ],
+                            "snrBack": [
+                                s / 4 for s in rd_dict.get("snrBack", [])
+                            ],
+                        })
+                    except Exception as e:
+                        _finish(
+                            {"result": "error", "dest": dest,
+                             "error": str(e)}
+                        )
+
+                def _timeout():
+                    time.sleep(15 * hop_limit + 15)
+                    _finish({"result": "timeout", "dest": dest})
+
+                def _send():
+                    try:
+                        from meshtastic.protobuf import (
+                            mesh_pb2,
+                            portnums_pb2,
+                        )
+                        iface.sendData(
+                            mesh_pb2.RouteDiscovery(),
+                            destinationId=int(dest, 16),
+                            portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                            wantResponse=True,
+                            onResponse=_on_trace,
+                            hopLimit=hop_limit,
+                        )
+                    except Exception as e:
+                        _finish(
+                            {"result": "error", "dest": dest,
+                             "error": str(e)}
+                        )
+
+                client.publish(
+                    resp_topic,
+                    _json_dump({"result": "pending", "dest": dest}),
+                    retain=True,
+                )
+                threading.Thread(target=_timeout, daemon=True).start()
+                threading.Thread(target=_send, daemon=True).start()
                 return
             try:
                 my = userdata["interface"].getMyNodeInfo()
@@ -588,6 +789,10 @@ def run_bridge():
     mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
     mqttc.loop_start()
     mqttc.subscribe(f"{TOPIC_PREFIX}/#", qos=1)
+    if FORWARD_TOPIC:
+        # HA sensor -> mesh telemetry forwarding (see _forward_telemetry)
+        mqttc.subscribe(FORWARD_TOPIC, qos=1)
+        log.info("Telemetry forwarding enabled: watching %s", FORWARD_TOPIC)
 
     # Attach the packet callback via pubsub (the lib's actual event
     # mechanism for received packets). Subscribe exactly ONCE, outside
