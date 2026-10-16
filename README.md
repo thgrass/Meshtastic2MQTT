@@ -1,8 +1,8 @@
 # Meshtastic2MQTT
 
-A small Python script that connects a [Meshtastic](https://meshtastic.org) node over Bluetooth LE and bridges it to a local MQTT broker - so Home Assistant, Node-RED, Grafana or anything else on your LAN can read the mesh and talk back to it.
+A small Python script that connects a [Meshtastic](https://meshtastic.org) node over Bluetooth LE or serial and bridges it to a local MQTT broker - so Home Assistant, Node-RED, Grafana or anything else on your LAN can read the mesh and talk back to it.
 
-Written for a Raspberry Pi 4 and a solar-powered SenseCAP node, but it should work with any Meshtastic device that exposes BLE (T-Beam, RAK, Heltec, etc.).
+Written for a Raspberry Pi 4 and a solar-powered SenseCAP node, but it should work with any Meshtastic device that exposes BLE or has serial connectivity.
 
 ## What it does
 
@@ -15,8 +15,8 @@ Written for a Raspberry Pi 4 and a solar-powered SenseCAP node, but it should wo
 
 ## Requirements
 
-- Raspberry Pi (or any Linux box with Bluetooth)
-- A Meshtastic node, paired with the Pi over BLE
+- Raspberry Pi (or any Linux box)
+- A Meshtastic node, paired with the Pi over BLE or serial
 - Python 3.9+
 
 ```bash
@@ -27,30 +27,37 @@ python3 -m venv ~/bridge-venv
 
 ## Setup
 
-1. Find your node:
+1. Connect the node — pick **one** transport:
+
+   **Bluetooth** (default):
 
    ```bash
-   ~/bridge-venv/bin/meshtastic --ble-scan
+   ~/bridge-venv/bin/meshtastic --ble-scan          # find the MAC
+   bluetoothctl pair DE:AD:BE:EF:DE:ED
+   bluetoothctl trust DE:AD:BE:EF:DE:ED            # pair once, keys are reused
    ```
 
-2. Pair it once (this matters - the lib reuses the stored pairing keys):
+   Set `BLE_TARGET` in the script, or pass `--ble [MAC]` on the command line.
+
+   **USB serial** (wired, more stable; the phone app can stay connected in parallel):
 
    ```bash
-   bluetoothctl
-   [bluetooth]# pair DE:AD:BE:EF:DE:ED
-   [bluetooth]# trust DE:AD:BE:EF:DE:ED
-   [bluetooth]# exit
+   ls /dev/ttyACM*                                  # node appears as /dev/ttyACM0
+   sudo usermod -aG dialout $USER                   # one-time, then re-login
    ```
 
-3. Put the address in `BLE_TARGET` in `Meshtastic2MQTT.py` (also check `MQTT_HOST` / credentials if your broker isn't plain localhost).
+   Run with `--serial [PORT]` (auto-detects port when omitted), or set `TRANSPORT = "serial"` + `SERIAL_PORT` in the script.
 
-4. Run it:
+2. Run it:
 
    ```bash
-   ~/bridge-venv/bin/python3 Meshtastic2MQTT.py
+   ~/bridge-venv/bin/python3 Meshtastic2MQTT.py                      # BLE, config default
+   ~/bridge-venv/bin/python3 Meshtastic2MQTT.py --serial /dev/ttyACM0
    ```
 
-5. Or run it as a service with the included `meshtastic2mqtt.service` systemd unit (edit the paths and user first).
+   Also check `MQTT_HOST` / credentials in the config if your broker isn't plain localhost.
+
+3. Or as a service: edit paths and user, put your transport flags in the `ExecStart=` line of `meshtastic2mqtt.service`, then `sudo systemctl daemon-reload && sudo systemctl restart meshtastic2mqtt`.
 
 ## Topics
 
@@ -199,7 +206,7 @@ Wire `meshtastic/chat/dm` to a notification automation if you want a ping when s
 
 - Battery and friends refresh when the node broadcasts nodeinfo (every ~3 h by default). For hourly updates, enable device telemetry on the node (`telemetry.device_telemetry_enabled`) and set `device_update_interval`.
 - Meshtastic is best-effort: broadcasts aren't guaranteed to reach every node, and this bridge can't change that.
-- Only one client can talk to the node at a time - don't run this while also running `meshtastic` CLI against the same node or having your phone connected.
+- Only one BLE client can talk to the node at a time - but you can have BLE and serial at the same time.
 
 ## License
 
