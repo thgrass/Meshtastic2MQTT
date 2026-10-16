@@ -3,9 +3,8 @@
 Meshtastic BLE -> MQTT bridge for Raspberry Pi.
 
 Bridges a Meshtastic node (e.g. SenseCAP Solar Node, nRF52840) over
-Bluetooth LE to a local MQTT broker (mosquitto), so Home Assistant,
-Node-RED or any LAN client can read mesh traffic and send messages
-back to the mesh.
+Bluetooth LE to a local MQTT broker (mosquitto), so Home Assistant or
+any LAN client can read mesh traffic and send messages back to the mesh.
 
 Topic layout:
   meshtastic/bridge/status                       -> "online"/"offline" (retained, LWT)
@@ -81,8 +80,17 @@ MQTT_HOST / MQTT_USER / MQTT_PASS.
 
 Run:  ~/bridge-venv/bin/python3 Meshtastic2MQTT.py
 Or install as a service: see meshtastic2mqtt.service
+
+Transport (CLI switches override the TRANSPORT / BLE_TARGET /
+SERIAL_PORT config defaults; each switch takes an optional target):
+  Meshtastic2MQTT.py                         -> config default (BLE)
+  Meshtastic2MQTT.py --ble                   -> Bluetooth, default MAC
+  Meshtastic2MQTT.py --ble DE:AD:BE:EF:DE:ED -> Bluetooth, this MAC
+  Meshtastic2MQTT.py --serial                -> USB serial, auto-detect
+  Meshtastic2MQTT.py --serial /dev/ttyACM0   -> USB serial, this port
 """
 
+import argparse
 import base64
 import json
 import secrets
@@ -98,12 +106,20 @@ import paho.mqtt.client as mqtt
 from pubsub import pub
 from meshtastic import BROADCAST_ADDR
 from meshtastic.ble_interface import BLEInterface
+try:
+    from meshtastic.serial_interface import SerialInterface
+except ImportError:  # pyserial missing: --serial not available
+    SerialInterface = None
 from meshtastic.protobuf import portnums_pb2, telemetry_pb2
 
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-BLE_TARGET = "DE:AD:BE:EF:DE:ED"   # BLE MAC address from `meshtastic --ble-scan`; may work with BLE name
+# Transport defaults — CLI switches (--ble/--serial, each with an
+# optional MAC or device path) override these at runtime.
+TRANSPORT = "ble"                # "ble" | "serial"
+BLE_TARGET = "DE:AD:BE:EF:DE:ED" # BLE MAC address from `meshtastic --ble-scan`
+SERIAL_PORT = None               # e.g. "/dev/ttyACM0"; None = auto-detect
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 MQTT_USER = None                 # or "user" if mosquitto requires auth
@@ -114,7 +130,7 @@ NODE_TOPIC_PREFIX = "meshtastic/node"
 RECONNECT_DELAY = 5             # seconds between reconnect attempts
 HEARTBEAT_INTERVAL = 60         # seconds
 
-# ------- MQTT sensor / zigbee2mqtt -> mesh telemetry forwarding -------
+# ------- HA sensor / zigbee2mqtt -> mesh telemetry forwarding -------
 # The bridge watches every topic in FORWARD_TOPICS and broadcasts the
 # values as genuine EnvironmentTelemetry — to the mesh, this node
 # then looks like a sensor node. ONE packet per interval carries ALL
@@ -868,8 +884,44 @@ def _handle_sigterm(signum, frame):
     sys.exit(0)
 
 
+def _parse_args():
+    """CLI transport switches: --ble [MAC] and --serial [PORT],
+    mutually exclusive, each with an optional target. A given target
+    overrides BLE_TARGET/SERIAL_PORT; the bare switch means "this
+    transport, config default (or auto-detect)". With no switch at
+    all, the TRANSPORT config default applies."""
+    p = argparse.ArgumentParser(
+        description="Meshtastic <-> MQTT bridge "
+                    "(Bluetooth or USB serial transport)"
+    )
+    t = p.add_mutually_exclusive_group()
+    t.add_argument(
+        "--ble", nargs="?", const="", default=None, metavar="MAC",
+        help="Bluetooth transport; optional MAC from "
+             "`meshtastic --ble-scan` (default: BLE_TARGET)",
+    )
+    t.add_argument(
+        "--serial", nargs="?", const="", default=None, metavar="PORT",
+        help="USB serial transport; optional device path, e.g. "
+             "/dev/ttyACM0 (default: SERIAL_PORT, auto-detect "
+             "when unset)",
+    )
+    return p.parse_args()
+
+
 def run_bridge():
-    # systemd stop = SIGTERM: make sure the BLE link is closed cleanly
+    args = _parse_args()
+    if args.ble is not None:
+        transport, cli_target = "ble", (args.ble or None)
+    elif args.serial is not None:
+        transport, cli_target = "serial", (args.serial or None)
+    else:
+        transport, cli_target = TRANSPORT, None
+    if transport == "serial" and SerialInterface is None:
+        log.error("--serial requires pyserial (pip install pyserial)")
+        sys.exit(2)
+    log.info("Transport: %s", transport)
+    # systemd stop = SIGTERM: make sure the node link is closed cleanly
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
     mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
@@ -884,8 +936,7 @@ def run_bridge():
             ", ".join(FORWARD_TOPICS),
         )
 
-    # Attach the packet callback via pubsub (the lib's actual event
-    # mechanism for received packets). Subscribe exactly ONCE, outside
+    # Attach the packet callback via pubsub. Subscribe once, outside
     # the reconnect loop — re-subscribing on every reconnect would
     # stack duplicate listeners and duplicate every MQTT message.
     pub.subscribe(on_packet, "meshtastic.receive")
@@ -893,14 +944,26 @@ def run_bridge():
     while True:
         iface = None
         try:
-            log.info("Connecting to BLE device %s ...", BLE_TARGET)
-            iface = BLEInterface(BLE_TARGET)
+            if transport == "serial":
+                port = (
+                    cli_target if cli_target is not None else SERIAL_PORT
+                )
+                log.info(
+                    "Connecting to serial device %s ...",
+                    port or "auto-detect",
+                )
+                iface = SerialInterface(devPath=port)
+            else:
+                mac = cli_target if cli_target is not None else BLE_TARGET
+                log.info(
+                    "Connecting to BLE device %s ...", mac or "auto-detect"
+                )
+                iface = BLEInterface(mac)
             CURRENT_IFACE["iface"] = iface
             mqttc.user_data_set({"interface": iface})
 
             # Publish local node info (firmware, battery, voltage) once
-            # connected — this data lives in the node DB, not the
-            # packet stream.
+            # connected — this data lives in the node DB
             try:
                 my = iface.getMyNodeInfo()
                 user = my.get("user", {})
@@ -926,9 +989,9 @@ def run_bridge():
                 log.error("publishing local node info failed: %s", e)
 
             publish(f"{TOPIC_PREFIX}/status", "online", retain=True)
-            log.info("Connected. Bridging BLE <-> MQTT.")
+            log.info("Connected. Bridging %s <-> MQTT.", transport.upper())
 
-            # Heartbeat so you can see the bridge is alive in HA
+            # Heartbeat so you can see the bridge is alive
             while True:
                 time.sleep(HEARTBEAT_INTERVAL)
                 publish(
@@ -945,7 +1008,7 @@ def run_bridge():
             return
 
         except Exception as e:
-            log.error("BLE connection error: %s", e)
+            log.error("Connection error: %s", e)
             CURRENT_IFACE["iface"] = None
             try:
                 if iface:
