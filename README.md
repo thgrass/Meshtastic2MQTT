@@ -1,6 +1,6 @@
 # Meshtastic2MQTT
 
-A small Python script that connects a [Meshtastic](https://meshtastic.org) node over Bluetooth LE or serial and bridges it to a local MQTT broker - so Home Assistant, Node-RED, Grafana or anything else on your LAN can read the mesh and talk back to it.
+A Python script that connects a [Meshtastic](https://meshtastic.org) node over Bluetooth LE or serial and bridges it to a local MQTT broker - so Home Assistant, Node-RED, Grafana or anything else on your LAN can read the mesh and talk back to it.
 
 Written for a Raspberry Pi 4 and a solar-powered SenseCAP node, but it should work with any Meshtastic device that exposes BLE or has serial connectivity.
 
