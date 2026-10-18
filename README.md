@@ -8,8 +8,8 @@ Written for a Raspberry Pi 4 and a solar-powered SenseCAP node, but it should wo
 
 - Bridges every mesh packet to MQTT: telemetry, positions, text messages and node info
 - Sends sensor values from other MQTT sources via the telemetry app to the mesh
-- Publishes a clean chat stream that tells broadcasts and DMs apart
-- Lets you send text into the mesh via MQTT (broadcast or direct message)
+- Publishes a clean chat stream that tells broadcasts and DMs apart & lets you send text into the mesh via MQTT (broadcast or direct message)
+- Issue traceroute and ping commands on the mesh via MQTT
 - Answers MQTT on-demand queries about the local node (battery, voltage, firmware...)
 - Reconnects automatically when BLE drops, and announces itself dead via MQTT Last Will if it can't
 
@@ -101,6 +101,8 @@ Fields: `batteryLevel`, `voltage`, `channelUtilization`, `airUtilTx`, `uptimeSec
 
 `get/traceroute/<id>` makes a specific remote node answer with its route through the mesh - the MQTT-native way to verify your own sending works end to end, no human on the other end needed: the target node replies on its own, so a route response proves your TX and RX across the whole path. Result retained on `meshtastic/bridge/resp/traceroute`: `pending` → `ok` (each hop's node ID and SNR) → or `timeout`/`failed` (no working path right now). Optional hop limit 1-7 as a suffix: `get/traceroute/<id>/5`.
 
+`get/ping/<id>` checks whether a specific node is reachable: the bridge sends it a RouteDiscovery ping (the same mechanism the firmware's own ping uses) and the target node answers on its own - no human needed. Result retained on `meshtastic/bridge/resp/ping`: `pending` → `ok` (the node answered) → or `timeout`/`failed` (unreachable right now). Pings direct neighbors (hop limit 1); for nodes further away use `get/traceroute/<id>` instead.
+
 **MQTT sensors → mesh telemetry:** the bridge watches every topic in the `FORWARD_TOPICS` mapping and broadcasts the values as genuine `EnvironmentTelemetry` - remote nodes and apps then show your node as a sensor node. One packet every 15 minutes carries *all* current values, exactly like a real BME280 node. Two entry forms: `"topic": "temperature"` for topics whose payload is a bare number, or - the zigbee2mqtt case - `"zigbee2mqtt/<device>": {"temperature": "temperature", "humidity": "relative_humidity"}`, which maps the JSON keys of the device message straight to mesh fields (pick any subset; `battery`/`linkquality` etc. are ignored). Mesh etiquette is built in: at most one packet per 15 minutes and only when some value moved ≥ 0.3 (`FORWARD_MIN_INTERVAL` / `FORWARD_DEADBAND` constants at the top of the script; empty the dict to disable). These values can be changed in the script. The injected values are additionally published locally on `meshtastic/node/<this-node>/telemetry/environmentMetrics/<field>` (retained).
 
 **Store & Forward replays, unwrapped:** a Store & Forward server (a community router, recognizable by its `STORE_FORWARD_APP` heartbeats every 15 min) answers a DM containing the text `SF` by replaying the public broadcast chatter. Over the mesh those replays arrive wrapped in `STORE_FORWARD_APP` packets; the bridge unwraps them, so they appear as normal entries on `meshtastic/chat` (broadcasts) and `meshtastic/chat/dm` (DMs), correctly attributed to their original senders. Note: the server never replays your *own* messages back to you, and only what it heard while it was online.
@@ -124,6 +126,10 @@ mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | jq .
 # ...or find one by name
 mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | \
   jq -r '.[] | select(.longName | test("Solartastic"; "i"))'
+
+# ping a specific node — ok means it answered by itself
+mosquitto_pub -h localhost -t 'meshtastic/bridge/get/ping/aa98a368' -n
+mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/ping' -C 1 | jq .
 
 # positions for mapping (id, name, lat, lon)
 mosquitto_sub -h localhost -t 'meshtastic/bridge/resp/nodes' -C 1 | \
