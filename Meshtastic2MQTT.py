@@ -677,13 +677,14 @@ def on_mqtt_message(client, userdata, msg):
                     try:
                         decoded = p.get("decoded", {})
                         if decoded.get("portnum") == "ROUTING_APP":
-                            err = (decoded.get("routing") or {}).get(
-                                "errorReason"
-                            )
-                            _finish(
-                                {"result": "failed", "dest": dest,
-                                 "error": err}
-                            )
+                            err = (decoded.get("routing") or {}).get("errorReason")
+                            # Routing ACKs (errorReason empty) arrive BEFORE the
+                            # actual RouteDiscovery response - they are not a
+                            # verdict. Only a real error (NAK) finishes as "failed".
+                            if err and err != "NONE":
+                                _finish(
+                                    {"result": "failed", "dest": dest, "error": err}
+                                )
                             return
                         from meshtastic.protobuf import mesh_pb2
                         from google.protobuf import json_format
