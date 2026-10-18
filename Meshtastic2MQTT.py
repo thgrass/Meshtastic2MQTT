@@ -497,7 +497,6 @@ def _forward_telemetry(userdata, mapping, topic, payload_str):
     except Exception as e:
         log.error("Forward: telemetry broadcast failed: %s", e)
 
-
 def on_mqtt_message(client, userdata, msg):
     """Handle requests on meshtastic/bridge/get/... and text messages on
     meshtastic/bridge/to/.../text."""
@@ -749,6 +748,69 @@ def on_mqtt_message(client, userdata, msg):
                     _json_dump({"result": "pending", "dest": dest}),
                     retain=True,
                 )
+                threading.Thread(target=_timeout, daemon=True).start()
+                threading.Thread(target=_send, daemon=True).start()
+                return
+            # meshtastic/bridge/get/ping/<hexid> -> ping one node:
+            # a RouteDiscovery with wantResponse=True (the same
+            # mechanism the firmware's own ping uses). Answer
+            # retained on .../resp/ping: pending -> ok / failed /
+            # timeout. hopLimit=1 pings direct neighbors; raise it
+            # (max 7) for nodes further away.
+            if field == "ping":
+                if len(parts) < 5:
+                    return
+                dest = parts[4].replace("!", "").replace("0x", "").lower()
+                iface = userdata["interface"]
+                resp_topic = f"{TOPIC_PREFIX}/resp/ping"
+                state = {"done": False}
+
+                def _finish(body):
+                    if not state["done"]:
+                        state["done"] = True
+                        client.publish(resp_topic, _json_dump(body), retain=True)
+
+                def _on_pong(p):
+                    try:
+                        decoded = p.get("decoded", {})
+                        if decoded.get("portnum") == "ROUTING_APP":
+                            err = (decoded.get("routing") or {}).get("errorReason")
+                            # Routing ACKs are not a verdict; only a
+                            # real error (NAK) finishes as "failed".
+                            if err and err != "NONE":
+                                _finish({"result": "failed", "dest": dest, "error": err})
+                            return
+                        # RouteDiscovery answer = the pong itself
+                        frm = p.get("from")
+                        _finish({
+                            "result": "ok",
+                            "dest": dest,
+                            "from": f"{frm:08x}" if isinstance(frm, int) else None,
+                        })
+                    except Exception as e:
+                        _finish({"result": "error", "dest": dest, "error": str(e)})
+
+                def _timeout():
+                    time.sleep(20)          # 1 hop + margin
+                    _finish({"result": "timeout", "dest": dest})
+
+                def _send():
+                    try:
+                        from meshtastic.protobuf import mesh_pb2, portnums_pb2
+                        iface.sendData(
+                            mesh_pb2.RouteDiscovery(),
+                            destinationId=int(dest, 16),
+                            portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                            wantResponse=True,
+                            onResponse=_on_pong,
+                            hopLimit=1,       # direct-neighbor ping
+                        )
+                    except Exception as e:
+                        _finish({"result": "error", "dest": dest, "error": str(e)})
+
+                client.publish(resp_topic,
+                               _json_dump({"result": "pending", "dest": dest}),
+                               retain=True)
                 threading.Thread(target=_timeout, daemon=True).start()
                 threading.Thread(target=_send, daemon=True).start()
                 return
