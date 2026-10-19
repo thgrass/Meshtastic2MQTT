@@ -16,6 +16,7 @@ Topic layout:
   meshtastic/node/<nodeid>/position              -> JSON {lat, lon, alt}
   meshtastic/node/<nodeid>/text                  -> plain text message
   meshtastic/node/<nodeid>/json                  -> raw decoded packet JSON
+  meshtastic/node/<nodeid>/info                  -> local node info (longName etc.)
   meshtastic/chat                                -> every text message as JSON:
        {"fromId", "fromName", "to": "all"|"you", "channel", "text"}
   meshtastic/chat/dm                             -> only DMs addressed to this node
@@ -57,7 +58,10 @@ channelchallenge (one-time nonce for set/channel, on
 traceroute: get/traceroute/<hexid>[/<hops 1-7>] -> force a remote
   node to answer with its route through the mesh; verifies two-way
   delivery end to end; result retained on .../resp/traceroute
-  (pending -> ok with hops+SNR, or failed/timeout)
+  (pending -> ok with hops+SNR, or failed/timeout),
+ping: get/ping/<hexid> -> ping one node (RouteDiscovery with
+  wantResponse, hopLimit 1 = direct neighbor); result retained on
+  .../resp/ping (pending -> ok / failed / timeout).
 
 Set topic meshtastic/bridge/set/channel:
   Import a channel URL (from a QR code / channel link) into the
@@ -66,6 +70,13 @@ Set topic meshtastic/bridge/set/channel:
   — get the nonce first via get/channelchallenge. Result (retained)
   on .../resp/channel/result. Refuses imports that would change the
   LoRa region (would silently split the mesh).
+
+Local node metrics (battery etc.):
+  the node cannot hear its own broadcasts, so its battery/voltage
+  NEVER arrive via on_packet(). The bridge therefore re-publishes
+  the local node's info + device metrics from getMyNodeInfo() on
+  connect and then every LOCAL_POLL_INTERVAL seconds (see
+  _publish_local_info), so Home Assistant always sees fresh values.
 
 Requirements on the Pi:
   sudo apt install python3-venv bluetooth bluez mosquitto
@@ -123,12 +134,15 @@ SERIAL_PORT = None               # e.g. "/dev/ttyACM0"; None = auto-detect
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 MQTT_USER = None                 # or "user" if mosquitto requires auth
-MQTT_PASS = None                 # or "pass"
+MQTT_PASS = None                 # or "pass" if mosquitto requires auth
 MQTT_TLS = False                 # True if broker requires TLS
 TOPIC_PREFIX = "meshtastic/bridge"
 NODE_TOPIC_PREFIX = "meshtastic/node"
 RECONNECT_DELAY = 5             # seconds between reconnect attempts
 HEARTBEAT_INTERVAL = 60         # seconds
+LOCAL_POLL_INTERVAL = 300       # seconds between re-publishes of the
+                                # local node's own battery/voltage/info
+                                # (0 = only once on connect)
 
 # ------- HA sensor / zigbee2mqtt -> mesh telemetry forwarding -------
 # The bridge watches every topic in FORWARD_TOPICS and broadcasts the
@@ -226,6 +240,37 @@ def _get_firmware(interface):
             or getattr(myinfo, "firmwareVersion", None)
         )
     return None
+
+
+def _publish_local_info(iface):
+    """Publish this node's own info + device metrics from the node
+    DB (getMyNodeInfo). The node cannot hear its own broadcasts, so
+    on_packet() never delivers its battery/voltage — polling the DB
+    is the only way Home Assistant gets fresh values for THIS node.
+    Called once on connect and then every LOCAL_POLL_INTERVAL s."""
+    try:
+        my = iface.getMyNodeInfo()
+        user = my.get("user", {})
+        myid = user.get("id", "!unknown").lstrip("!")
+        metrics = my.get("deviceMetrics") or {}
+        for key in ("batteryLevel", "voltage",
+                    "channelUtilization", "airUtilTx"):
+            val = metrics.get(key)
+            if isinstance(val, (int, float)):
+                publish(f"{NODE_TOPIC_PREFIX}/{myid}/telemetry/device/{key}",
+                        val, retain=True)
+        info = {
+            "longName": user.get("longName"),
+            "shortName": user.get("shortName"),
+            "hwModel": user.get("hwModel"),
+        }
+        fw = _get_firmware(iface)
+        if fw:
+            info["firmwareVersion"] = fw
+        publish(f"{NODE_TOPIC_PREFIX}/{myid}/info",
+                json.dumps(info), retain=True)
+    except Exception as e:
+        log.error("publishing local node info failed: %s", e)
 
 
 # NeighborInfo packets (needs the neighborinfo module enabled on the
@@ -1025,42 +1070,35 @@ def run_bridge():
             CURRENT_IFACE["iface"] = iface
             mqttc.user_data_set({"interface": iface})
 
-            # Publish local node info (firmware, battery, voltage) once
-            # connected — this data lives in the node DB
-            try:
-                my = iface.getMyNodeInfo()
-                user = my.get("user", {})
-                myid = user.get("id", "!unknown").lstrip("!")
-                metrics = my.get("deviceMetrics") or {}
-                for key in ("batteryLevel", "voltage",
-                            "channelUtilization", "airUtilTx"):
-                    val = metrics.get(key)
-                    if isinstance(val, (int, float)):
-                        publish(f"{NODE_TOPIC_PREFIX}/{myid}/telemetry/device/{key}",
-                                val, retain=True)
-                info = {
-                    "longName": user.get("longName"),
-                    "shortName": user.get("shortName"),
-                    "hwModel": user.get("hwModel"),
-                }
-                fw = _get_firmware(iface)
-                if fw:
-                    info["firmwareVersion"] = fw
-                publish(f"{NODE_TOPIC_PREFIX}/{myid}/info",
-                        json.dumps(info), retain=True)
-            except Exception as e:
-                log.error("publishing local node info failed: %s", e)
+            # Publish local node info (firmware, battery, voltage)
+            # once connected — and re-publish every LOCAL_POLL_INTERVAL
+            # seconds afterwards (see heartbeat loop below).
+            _publish_local_info(iface)
 
             publish(f"{TOPIC_PREFIX}/status", "online", retain=True)
             log.info("Connected. Bridging %s <-> MQTT.", transport.upper())
 
-            # Heartbeat so you can see the bridge is alive
+            # Heartbeat so you can see the bridge is alive, plus the
+            # periodic re-publish of this node's own metrics: the node
+            # cannot hear its own broadcasts, so on_packet() never
+            # delivers its battery/voltage — polling the node DB is
+            # the only way HA gets fresh local values.
+            secs = 0  # seconds elapsed in this connect cycle
             while True:
-                time.sleep(HEARTBEAT_INTERVAL)
-                publish(
-                    f"{TOPIC_PREFIX}/heartbeat",
-                    datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                )
+                time.sleep(1)
+                secs += 1
+                if secs % HEARTBEAT_INTERVAL == 0:
+                    publish(
+                        f"{TOPIC_PREFIX}/heartbeat",
+                        datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    )
+                if (
+                    LOCAL_POLL_INTERVAL
+                    and secs % LOCAL_POLL_INTERVAL == 0
+                ):
+                    _publish_local_info(iface)
 
         except KeyboardInterrupt:
             log.info("Shutting down.")
