@@ -197,6 +197,8 @@ Add the topics you care about to `configuration.yaml`, e.g.:
 ```yaml
 mqtt:
   sensor:
+    - name: "Meshtastic Heartbeat"
+      state_topic: "meshtastic/bridge/heartbeat"
     - name: "Mesh node battery"
       state_topic: "meshtastic/node/991ad4fa/telemetry/device/batteryLevel"
       unit_of_measurement: "%"
